@@ -139,6 +139,20 @@ class LLMCompatibilityTests(unittest.TestCase):
         self.assertEqual(decision["optimized_hypothesis"], "Smoother reversal")
         self.assertEqual(decision["optimized_expression"], "-rank(ts_mean(returns, 5))")
 
+    def test_optimize_accepts_two_new_candidates(self):
+        fake = FakeTransport({"choices": [{"message": {"content": (
+            '{"action":"OPTIMIZE","reason":"Compare two variations","target_id":"candidate123",'
+            '"next_direction":"","parameter_changes":{"decay":0,"truncation":0.08,'
+            '"neutralization":"SUBINDUSTRY"},"optimized_hypothesis":"",'
+            '"optimized_expression":"","optimized_candidates":['
+            '{"hypothesis":"Center rank","expression":"0.5-rank(close/vwap)"},'
+            '{"hypothesis":"Smooth rank","expression":"ts_mean(rank(close/vwap),3)"}]}'
+        )}}]})
+        config = ModelConfig("openai", "test-model", "fake-key", "https://example.test/v1",
+                             "chat_completions")
+        decision = LLM(config, fake).decide({})
+        self.assertEqual(len(decision["optimized_candidates"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+from datetime import datetime
 from pathlib import Path
 
 
@@ -18,7 +19,7 @@ class SecretFormatter(logging.Formatter):
         return message
 
 
-def setup_logging(log_file: Path, level: str = "INFO") -> None:
+def setup_logging(log_file: Path, level: str = "INFO") -> Path:
     logger = logging.getLogger("research_workflow")
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
@@ -33,7 +34,11 @@ def setup_logging(log_file: Path, level: str = "INFO") -> None:
 
     path = Path(log_file)
     path.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = RotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    started = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+    session_path = path.with_name(f"{path.stem}_{started}_{os.getpid()}{path.suffix or '.log'}")
+    file_handler = RotatingFileHandler(session_path, maxBytes=10 * 1024 * 1024,
+                                       backupCount=5, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(SecretFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     logger.addHandler(file_handler)
+    return session_path

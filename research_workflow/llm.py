@@ -32,12 +32,16 @@ DECIDE_SCHEMA = {
                    "next_direction": {"type": "string"},
                    "optimized_hypothesis": {"type": "string"},
                    "optimized_expression": {"type": "string"},
+                   "optimized_candidates": {"type": "array", "maxItems": 2,
+                       "items": {"type": "object", "additionalProperties": False,
+                       "properties": {"hypothesis": {"type": "string"}, "expression": {"type": "string"}},
+                       "required": ["hypothesis", "expression"]}},
                    "parameter_changes": {"type": "object", "additionalProperties": False,
                        "properties": {"decay": {"type": "integer"}, "truncation": {"type": "number"},
                                       "neutralization": {"type": "string"}},
                        "required": ["decay", "truncation", "neutralization"]}},
     "required": ["action", "reason", "target_id", "next_direction", "parameter_changes",
-                 "optimized_hypothesis", "optimized_expression"]}
+                 "optimized_hypothesis", "optimized_expression", "optimized_candidates"]}
 PARAMETER_DECISION_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {"explore": {"type": "boolean"}, "reason": {"type": "string"}},
@@ -208,9 +212,22 @@ class LLM:
                 result[field] = ""
             if not isinstance(result.get(field), str):
                 raise ValueError(f"Decision {field} must be a string; got {type(result.get(field)).__name__}")
-        if result["action"] == "OPTIMIZE" and not all(result[field].strip() for field in
-                                                    ("optimized_hypothesis", "optimized_expression")):
-            raise ValueError("OPTIMIZE requires nonempty optimized_hypothesis and optimized_expression")
+        candidates = result.get("optimized_candidates", [])
+        if not isinstance(candidates, list) or len(candidates) > 2:
+            raise ValueError("optimized_candidates must contain at most two items")
+        if result["action"] == "OPTIMIZE" and not candidates:
+            if not all(result[field].strip() for field in ("optimized_hypothesis", "optimized_expression")):
+                raise ValueError("OPTIMIZE requires optimized_candidates or a nonempty legacy hypothesis and expression")
+            candidates = [{"hypothesis": result["optimized_hypothesis"],
+                           "expression": result["optimized_expression"]}]
+        for index, candidate in enumerate(candidates, 1):
+            if (not isinstance(candidate, dict) or not isinstance(candidate.get("hypothesis"), str)
+                    or not candidate["hypothesis"].strip() or not isinstance(candidate.get("expression"), str)
+                    or not candidate["expression"].strip()):
+                raise ValueError(f"optimized candidate {index} needs nonempty hypothesis and expression")
+        if result["action"] != "OPTIMIZE" and candidates:
+            raise ValueError("optimized_candidates is only valid for OPTIMIZE")
+        result["optimized_candidates"] = candidates
         return result
 
     def decide_parameter(self, context: dict) -> dict:

@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from research_workflow.brain import is_checks_passed
+from research_workflow.brain import Brain as BrainClient, is_checks_passed
 from research_workflow.config import Config
 from research_workflow.engine import Engine, stagnant_count
 from research_workflow.library import eligible_counts
@@ -47,6 +47,18 @@ class OptimizeJudge:
                 "parameter_changes": {"decay": 0, "truncation": 0.08, "neutralization": "SUBINDUSTRY"},
                 "optimized_hypothesis": "Smoothed reversal has less turnover",
                 "optimized_expression": "-rank(ts_mean(returns, 5))"}
+
+
+class BatchOptimizeJudge(OptimizeJudge):
+    def decide(self, context):
+        decision = super().decide(context)
+        decision["optimized_hypothesis"] = ""
+        decision["optimized_expression"] = ""
+        decision["optimized_candidates"] = [
+            {"hypothesis": "Center the reversal", "expression": "0.5-rank(close/vwap)"},
+            {"hypothesis": "Smooth the reversal", "expression": "ts_mean(0.5-rank(close/vwap),3)"},
+        ]
+        return decision
 
 
 class FamilyJudge:
@@ -112,6 +124,25 @@ class RateLimitedBrain(Brain):
 class InvalidExpressionBrain(Brain):
     def start_simulation(self, expression, settings):
         raise RemoteError(400, "invalid expression")
+
+
+class WarningBrain(Brain):
+    def __init__(self):
+        super().__init__()
+        self.polls = 0
+
+    def poll_simulation(self, url):
+        self.polls += 1
+        if self.polls == 1:
+            return {"status": "WARNING", "alpha_id": "A1V0K68w",
+                    "message": 'Incompatible unit for input of "add"',
+                    "location": {"type": "UNITS", "property": "regular"}}, 0
+        return super().poll_simulation(url)
+
+
+class WarningReadyBrain(Brain):
+    def poll_simulation(self, url):
+        return {"status": "WARNING", "alpha_id": "A1V0K68w", "message": "Unit warning", "is": PASS_IS}, 0
 
 
 class FailedChecksBrain(Brain):
@@ -183,6 +214,42 @@ class WorkflowTests(unittest.TestCase):
                          ["LOW_FITNESS", "HIGH_TURNOVER"])
         self.assertFalse((self.config.library_dir / "wq_A123.md").exists())
 
+    def test_brain_warning_continues_polling_until_complete(self):
+        brain = WarningBrain()
+        engine = Engine(self.config, self.store, Generator(), FamilyJudge(), brain)
+        engine.step(self.run_id)
+        engine.step(self.run_id)
+        self.assertIn("simulation pending", engine.step(self.run_id))
+        candidate = self.store.one("SELECT * FROM candidates WHERE run_id=?", (self.run_id,))
+        self.assertEqual(candidate["status"], "simulating")
+        self.assertIn("simulation complete", engine.step(self.run_id))
+        self.assertEqual(brain.polls, 2)
+
+    def test_brain_warning_with_alpha_results_advances_to_checks(self):
+        engine = Engine(self.config, self.store, Generator(), FamilyJudge(), WarningReadyBrain())
+        engine.step(self.run_id)
+        engine.step(self.run_id)
+        self.assertIn("simulation complete", engine.step(self.run_id))
+        candidate = self.store.one("SELECT * FROM candidates WHERE run_id=?", (self.run_id,))
+        self.assertEqual((candidate["status"], candidate["alpha_id"]), ("checking", "A1V0K68w"))
+        self.assertEqual(engine._inflight_simulations(), 0)
+
+    def test_brain_adapter_fetches_alpha_results_for_warning(self):
+        class Transport:
+            def request(self, method, url, payload=None, headers=None):
+                if url.endswith("/authentication"):
+                    return 201, {}, {}
+                if url.endswith("/simulations/test"):
+                    return 200, {}, {"status": "WARNING", "alpha": "/alphas/A1V0K68w", "message": "Unit warning"}
+                if url.endswith("/alphas/A1V0K68w"):
+                    return 200, {}, {"status": "UNSUBMITTED", "is": PASS_IS}
+                raise AssertionError(url)
+
+        data, _ = BrainClient(replace(self.config, email="fake@example.test", password="fake"), Transport()).poll_simulation(
+            self.config.brain_url + "/simulations/test")
+        self.assertEqual(data["alpha_id"], "A1V0K68w")
+        self.assertEqual(data["is"]["sharpe"], 1.5)
+
     def test_optimize_creates_backtest_candidate_with_parent_lineage(self):
         engine = Engine(self.config, self.store, Generator(), OptimizeJudge(), FailedChecksBrain())
         for _ in range(4):
@@ -197,6 +264,21 @@ class WorkflowTests(unittest.TestCase):
                               .read_text(encoding="utf-8"))
         self.assertEqual(exported["parent_candidate_id"], original["id"])
         self.assertIn("simulation started", engine.step(self.run_id))
+
+    def test_optimize_batch_starts_two_simulations(self):
+        brain = FailedChecksBrain()
+        engine = Engine(self.config, self.store, Generator(), BatchOptimizeJudge(), brain)
+        for _ in range(4):
+            engine.step(self.run_id)
+        original = self.store.one("SELECT * FROM candidates WHERE status='rejected'")
+        self.assertIn("model chose OPTIMIZE", engine.step(self.run_id))
+        optimized = self.store.all("SELECT * FROM candidates WHERE origin_action='OPTIMIZE' ORDER BY id")
+        self.assertEqual(len(optimized), 2)
+        self.assertEqual({c["parent_candidate_id"] for c in optimized}, {original["id"]})
+        self.assertEqual({c["hypothesis"] for c in optimized},
+                         {"Center the reversal", "Smooth the reversal"})
+        self.assertEqual(engine.step(self.run_id).count("BRAIN simulation started"), 2)
+        self.assertEqual(brain.starts, 3)
 
     def test_existing_database_adds_candidate_lineage_columns(self):
         legacy_path = Path(self.temp.name) / "legacy.sqlite3"

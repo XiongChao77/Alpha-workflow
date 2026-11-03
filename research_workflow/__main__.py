@@ -37,8 +37,9 @@ def main():
     command = args.command or "start"
     load_config_file(args.config or DEFAULT_CONFIG_FILE, required=args.config is not None)
     config = Config()
-    setup_logging(config.log_file, config.log_level)
+    session_log_file = setup_logging(config.log_file, config.log_level)
     log = logging.getLogger(__package__)
+    log.info("本次运行日志 path=%s", session_log_file)
     if command == "check":
         model = model_config()
         print({"model": (model.provider, model.model, bool(model.api_key)),

@@ -8,8 +8,8 @@
 
 1. 模型按研究方向生成带经济假设的 FASTEXPR 模板、一个固定的 `Period` 默认值，以及最多两个额外参数及其离散候选值。程序依次测试 `ALPHA_PERIOD_GRID`（默认 `30,60,90`）与模型给出的 Period 值，去重后逐个发送 BRAIN；所有其他参数先用默认值。
 2. workflow 校验基本格式、跨轮去重，并可选调用 QuantGPT 本地回测。
-3. BRAIN 模拟完成后读取其 IS 检查。所有现有 IS 检查均为 `PASS` 时，立即在 `alpha_libraries/wq_<alpha_id>.md` 保存思路、公式、设置和结果。
-4. Period 测试全部完成后，若没有任何结果的 Sharpe **严格大于 1**，该族停止；否则选择 Sharpe 最高的 Period，固定它后探索第一个额外参数。第二维完成后，模型结合该族结果决定是否探索第三维。随后决策模型一次只看到**一个假设族**的完整历史（根候选及其参数搜索、`OPTIMIZE`/`TUNE` 子候选），返回 `NEW_DIRECTION`、`OPTIMIZE`、`TUNE` 或 `SUBMIT`。`OPTIMIZE` 必须直接给出新假设与新公式；`TUNE` 沿用公式修改参数。
+3. BRAIN 模拟完成后读取其 IS 检查。若模拟接口返回 `WARNING` 但已提供 Alpha ID，程序会读取 Alpha 详情；详情已有 IS 结果时直接进入检查，否则继续轮询。所有现有 IS 检查均为 `PASS` 时，立即在 `alpha_libraries/wq_<alpha_id>.md` 保存思路、公式、设置和结果。
+4. Period 测试全部完成后，若没有任何结果的 Sharpe **严格大于 1**，该族停止；否则选择 Sharpe 最高的 Period，固定它后探索第一个额外参数。第二维完成后，模型结合该族结果决定是否探索第三维。随后决策模型一次只看到**一个假设族**的完整历史（根候选及其参数搜索、`OPTIMIZE`/`TUNE` 子候选），返回 `NEW_DIRECTION`、`OPTIMIZE`、`TUNE` 或 `SUBMIT`。`OPTIMIZE` 一次可给出 1～2 组新假设与新公式，分别入队并利用 BRAIN 并发槽位；`TUNE` 沿用公式修改参数。
 5. 所有通过 BRAIN 检查的 Alpha 统一写入 `alpha_libraries/eligible_alphas.json`，包含 `submitted`、提交状态和日期。模型从尚未提交的合格因子中选择当日一个候选。北京时间每天、整个工作流数据库最多占用一个正式提交槽位。发起提交后回查 BRAIN 状态，并更新同一份归档。即使结果不明确，也不会当天再次提交另一个 Alpha。
 
 任务、候选、决策、提交占位和服务冷却时间写入 SQLite。服务重启后可继续 `run`。如果模拟 POST 的结果不明确，候选标为 `unknown`，需要在 BRAIN 核实后处理，避免重复创建。
@@ -60,7 +60,7 @@ wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/d/Project/QR/WorldQuant-Alpha && python
 
 ## 运行日志
 
-控制台按 `ALPHA_LOG_LEVEL` 输出进度（默认 `INFO`），包括当前探索方向、候选假设和公式、模型决策与理由、BRAIN 模拟指标和逐项检查、提交状态及服务退让时间。`research_workflow/logs/workflow.log` 同时保存 `DEBUG` 级别的模型输入和 JSON 输出、BRAIN 完整结果，便于复盘。文件达到 10 MB 后轮转，保留 5 份备份；可通过 `ALPHA_LOG_FILE` 指定路径。配置中的模型密钥、BRAIN 密码和 QuantGPT token 会从日志文本中遮盖；日志可能包含研究目标、公式、模型回复和平台结果，应按私有研究数据保管。
+控制台按 `ALPHA_LOG_LEVEL` 输出进度（默认 `INFO`），包括当前探索方向、候选假设和公式、模型决策与理由、BRAIN 模拟指标和逐项检查、提交状态及服务退让时间。每次启动会在 `research_workflow/logs/` 新建独立文件，例如 `workflow_20261104_003000_123456_12345.log`，并在启动日志中打印实际路径；同一次运行的模型输入输出、BRAIN 完整结果仍写入该文件。单个文件达到 10 MB 后轮转，保留 5 份备份；`ALPHA_LOG_FILE` 用于指定目录和文件名前缀。配置中的模型密钥、BRAIN 密码和 QuantGPT token 会从日志文本中遮盖；日志可能包含研究目标、公式、模型回复和平台结果，应按私有研究数据保管。
 
 持续运行时，独立统计线程每 10 秒打印一次“符合条件总数、已提交因子数、今日提交因子数”。已提交数指已收到成功提交响应或之后经 BRAIN 确认 ACTIVE 的因子；提交请求结果不明确的记录会单独标为 `uncertain`，仍占用当日唯一提交槽位。
 

@@ -49,13 +49,12 @@ class Brain:
             raise ValueError("Unexpected simulation URL")
         _, headers, data = self.http.request("GET", location)
         status = str(data.get("status", "")).upper()
-        if status in {"DONE", "COMPLETE"}:
-            alpha = str(data.get("alpha") or "").rstrip("/").split("/")[-1]
-            if alpha and not data.get("is"):
-                detail = self.get_alpha(alpha)
-                data["is"] = detail.get("is", {})
-                data["oos"] = detail.get("oos", {})
-            data["alpha_id"] = alpha or None
+        alpha = str(data.get("alpha") or "").rstrip("/").split("/")[-1]
+        data["alpha_id"] = alpha or None
+        if status in {"DONE", "COMPLETE", "WARNING"} and alpha and not data.get("is"):
+            detail = self.get_alpha(alpha)
+            data["is"] = detail.get("is", {})
+            data["oos"] = detail.get("oos", {})
         return data, retry_seconds(headers.get("Retry-After"), 10)
 
     def get_alpha(self, alpha_id: str) -> dict:

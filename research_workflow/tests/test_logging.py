@@ -28,7 +28,7 @@ class LoggingTests(unittest.TestCase):
         run_id = store.create_run("test alpha mining", "volume reversal")
         secret = "test-secret-value-123"
         with patch.dict(os.environ, {"LLM_API_KEY": secret, "WQ_BRAIN_PASSWORD": "test-password-123"}):
-            setup_logging(log_path, "WARNING")
+            session_log_path = setup_logging(log_path, "WARNING")
             try:
                 fake = FakeTransport({"choices": [{"message": {"content": '{"ok":true}'}}]})
                 model = LLM(ModelConfig("openai", "test-model", secret, "https://example.test/v1",
@@ -40,7 +40,7 @@ class LoggingTests(unittest.TestCase):
                 logging.getLogger("research_workflow").info("credential echo %s", secret)
                 for handler in logging.getLogger("research_workflow").handlers:
                     handler.flush()
-                contents = log_path.read_text(encoding="utf-8")
+                contents = session_log_path.read_text(encoding="utf-8")
                 self.assertIn("模型输入 stage=connectivity_check", contents)
                 self.assertIn("模型输出 stage=connectivity_check", contents)
                 self.assertIn("探索方向", contents)
@@ -50,6 +50,11 @@ class LoggingTests(unittest.TestCase):
                 self.assertIn("test another reversal horizon", contents)
                 self.assertNotIn(secret, contents)
                 self.assertIn("[REDACTED]", contents)
+                self.assertNotEqual(session_log_path, log_path)
+                self.assertTrue(session_log_path.name.startswith("workflow_"))
+                other_log_path = setup_logging(log_path, "WARNING")
+                self.assertNotEqual(other_log_path, session_log_path)
+                self.assertTrue(session_log_path.exists())
             finally:
                 logger = logging.getLogger("research_workflow")
                 for handler in logger.handlers[:]:

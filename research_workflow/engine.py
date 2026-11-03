@@ -197,7 +197,8 @@ class Engine:
                             "checks": [{"name": x.get("name"), "result": x.get("result"),
                                         "value": x.get("value"), "limit": x.get("limit")}
                                        for x in (is_data.get("checks") or [])],
-                            "error": str(result.get("error", ""))[:300]})
+                            "error": str(result.get("error") or
+                                         (result.get("message") if c["status"] == "failed" else "") or "")[:300]})
         return summary
 
     def _next_family(self, run_id):
@@ -599,13 +600,21 @@ class Engine:
                 data, wait = self.brain.poll_simulation(candidate["simulation_url"])
                 log.debug("BRAIN 模拟返回 candidate=%s result=%s", candidate["id"], json.dumps(data, ensure_ascii=False))
                 platform_status = str(data.get("status") or "").upper()
-                log.info("BRAIN 模拟状态 candidate=%s status=%s alpha_id=%s metrics=%s", candidate["id"],
-                         platform_status, data.get("alpha_id"), result_summary(data))
+                log.info("BRAIN 模拟状态 candidate=%s status=%s progress=%s alpha_id=%s metrics=%s", candidate["id"],
+                         platform_status or "(pending)", data.get("progress"), data.get("alpha_id"),
+                         result_summary(data))
+                if platform_status == "WARNING":
+                    log.info("BRAIN 模拟警告 candidate=%s alpha_id=%s message=%s location=%s；继续轮询",
+                             candidate["id"], data.get("alpha_id"), data.get("message"), data.get("location"))
                 if platform_status in {"ERROR", "FAILED"}:
-                    log.warning("BRAIN 模拟失败 candidate=%s result=%s", candidate["id"], json.dumps(data, ensure_ascii=False))
-                    self.store.update_candidate(candidate["id"], status="failed", result=retain_local_result(candidate, data))
+                    log.warning("BRAIN 模拟失败 candidate=%s status=%s message=%s location=%s",
+                                candidate["id"], platform_status, data.get("message"), data.get("location"))
+                    self.store.update_candidate(candidate["id"], status="failed", alpha_id=data.get("alpha_id"),
+                                                result=retain_local_result(candidate, data))
                     return f"BRAIN simulation failed: {candidate['id']}"
-                if platform_status in {"DONE", "COMPLETE"}:
+                if platform_status in {"DONE", "COMPLETE"} or (
+                    platform_status == "WARNING" and data.get("alpha_id") and data.get("is")
+                ):
                     self.store.update_candidate(candidate["id"], status="checking", alpha_id=data.get("alpha_id"),
                                                 result=retain_local_result(candidate, data), not_before=self._later(wait))
                     return f"BRAIN simulation complete: {candidate['id']}"
@@ -670,9 +679,10 @@ class Engine:
             log.warning("模型决策结果无效 reason=%s", exc)
             return f"invalid decision response: {exc}"
         action = decision["action"]
-        log.info("模型决策 run_id=%s action=%s reason=%s target=%s next_direction=%s changes=%s optimized_hypothesis=%s optimized_expression=%s",
+        log.info("模型决策 run_id=%s action=%s reason=%s target=%s next_direction=%s changes=%s optimized_candidates=%s optimized_hypothesis=%s optimized_expression=%s",
                  run["id"], action, decision["reason"], decision["target_id"],
                  decision["next_direction"], decision["parameter_changes"],
+                 decision.get("optimized_candidates"),
                  decision.get("optimized_hypothesis"), decision.get("optimized_expression"))
         log.debug("模型决策输入 context=%s", json.dumps(context, ensure_ascii=False))
         target = self.store.one("SELECT * FROM candidates WHERE id=? AND run_id=?", (decision["target_id"], run["id"])) if decision["target_id"] else None
@@ -703,19 +713,40 @@ class Engine:
                 self.store.set_cooldown("llm", 60, "duplicate parameter combination")
                 return "invalid model decision: duplicate parameter combination"
         if action == "OPTIMIZE":
-            hypothesis = decision.get("optimized_hypothesis", "").strip()
-            expression = decision.get("optimized_expression", "").strip()
-            if not hypothesis or not valid_expression(expression) or expression == target["expression"]:
-                self.store.set_cooldown("llm", 60, "invalid optimized candidate")
-                log.warning("模型优化未执行：新假设或公式无效 target=%s formula=%s", target["id"], expression)
-                return "invalid model decision: optimized hypothesis or expression is invalid"
-            new_id = self.store.add_candidate(run["id"], run["round"] + 1, hypothesis, expression,
-                                              json.loads(target["settings"]), target["id"], "OPTIMIZE")
-            if not new_id:
-                self.store.set_cooldown("llm", 60, "duplicate optimized expression")
-                return "invalid model decision: optimized expression already tested"
-            log.info("模型优化产生新候选 parent=%s candidate=%s hypothesis=%s formula=%s", target["id"],
-                     new_id, hypothesis, expression)
+            proposals = decision.get("optimized_candidates") or [{
+                "hypothesis": decision.get("optimized_hypothesis", ""),
+                "expression": decision.get("optimized_expression", "")
+            }]
+            if not 1 <= len(proposals) <= 2:
+                self.store.set_cooldown("llm", 60, "invalid optimized candidate count")
+                return "invalid model decision: expected one or two optimized candidates"
+            normalized = []
+            seen = set()
+            for proposal in proposals:
+                hypothesis = proposal.get("hypothesis", "").strip()
+                expression = proposal.get("expression", "").strip()
+                key = "".join(expression.split()).lower()
+                if (not hypothesis or not valid_expression(expression) or
+                        key == "".join(target["expression"].split()).lower() or key in seen):
+                    self.store.set_cooldown("llm", 60, "invalid optimized candidate")
+                    return "invalid model decision: optimized hypotheses or expressions are invalid or repeated"
+                seen.add(key)
+                normalized.append((hypothesis, expression, key))
+            settings = json.loads(target["settings"])
+            settings_json = json.dumps(settings, sort_keys=True)
+            for _, _, key in normalized:
+                if self.store.one("SELECT id FROM candidates WHERE run_id=? AND expression_key=? AND settings=?",
+                                  (run["id"], key, settings_json)):
+                    self.store.set_cooldown("llm", 60, "duplicate optimized expression")
+                    return "invalid model decision: optimized expression already tested"
+            for hypothesis, expression, _ in normalized:
+                new_id = self.store.add_candidate(run["id"], run["round"] + 1, hypothesis, expression,
+                                                  settings, target["id"], "OPTIMIZE")
+                if not new_id:
+                    self.store.set_cooldown("llm", 60, "duplicate optimized expression")
+                    return "invalid model decision: optimized expression already tested"
+                log.info("模型优化产生新候选 parent=%s candidate=%s hypothesis=%s formula=%s", target["id"],
+                         new_id, hypothesis, expression)
         with self.store.tx() as db:
             db.execute("INSERT INTO decisions VALUES (?,?,?,?,?)", (uuid.uuid4().hex[:12], run["id"], json.dumps(context, ensure_ascii=False), json.dumps(decision, ensure_ascii=False), now()))
             db.execute("UPDATE runs SET decision_due=0, direction=? WHERE id=?", (decision["next_direction"] or run["direction"], run["id"]))

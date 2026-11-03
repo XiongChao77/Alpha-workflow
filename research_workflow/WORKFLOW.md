@@ -27,7 +27,7 @@ flowchart TD
     K -- 否 --> M{"有待复盘的假设族？"}
     M -- 是 --> N["模型复盘同一假设族<br/>prompts/decide.txt"]
     N --> O{"模型决定"}
-    O -- OPTIMIZE --> Q["新假设 + 新公式入队"]
+    O -- OPTIMIZE --> Q["1～2 组新假设 + 新公式入队"]
     O -- TUNE --> R["同公式调整 BRAIN 设置入队"]
     O -- NEW_DIRECTION --> T["更新探索方向"]
     O -- SUBMIT --> U["复核 PASS 与每日名额后提交"]
@@ -51,7 +51,7 @@ flowchart TD
 | 调用时机 / 日志 `stage` | 默认 system prompt | JSON 输入重点 | 要求的 JSON 输出 | 工作流随后做什么 |
 | --- | --- | --- | --- | --- |
 | 新一轮生成 / `alpha_candidates` | [prompts/generate.txt](prompts/generate.txt) | `objective`、`direction`、`requested_count`、BRAIN `settings`、本任务最近 **30** 个候选的 `history` | `candidates[]`：每项含 `hypothesis`、`expression_template`、`period`（`name=Period` 和一个固定 `default`）、`parameters`（0～2 个，各含名称、默认值、离散值列表） | 校验模板、去重；本地替换占位符并建立参数搜索候选。历史用于避免重复，不表示会同时优化 30 个族。 |
-| 同一假设族复盘 / `research_decision` | [prompts/decide.txt](prompts/decide.txt) | `objective`、`direction`、`family_id`、最新候选 ID、连续未改善次数、**该族完整** `history`、今日提交名额和剩余模拟预算 | `action`=`NEW_DIRECTION` / `OPTIMIZE` / `TUNE` / `SUBMIT`，以及 `reason`、`target_id`、`next_direction`、`parameter_changes`、`optimized_hypothesis`、`optimized_expression` | 校验 `target_id` 属于本族；优化时直接保存新的假设和公式，调参时保存新 BRAIN 设置；提交时再次检查资格。 |
+| 同一假设族复盘 / `research_decision` | [prompts/decide.txt](prompts/decide.txt) | `objective`、`direction`、`family_id`、最新候选 ID、连续未改善次数、**该族完整** `history`、今日提交名额和剩余模拟预算 | `action`=`NEW_DIRECTION` / `OPTIMIZE` / `TUNE` / `SUBMIT`，以及 `reason`、`target_id`、`next_direction`、`parameter_changes`；`OPTIMIZE` 返回 `optimized_candidates`（1～2 组假设与公式，旧版单组字段仍兼容） | 校验 `target_id` 属于本族；优化时分别保存新假设和公式，调参时保存新 BRAIN 设置；提交时再次检查资格。 |
 | 决定是否探索第三维 / `parameter_decision` | [prompts/parameter_decide.txt](prompts/parameter_decide.txt) | `family_id`、该族完整 `history`、已选参数值、待探索的第二个额外参数及其候选值、剩余模拟预算 | `{"explore": true/false, "reason": "..."}` | `true` 时本地生成第三维候选；`false` 时结束参数搜索。 |
 | 选择当日一个提交项 / `submission_selection` | [prompts/select_submission.txt](prompts/select_submission.txt) | `eligible`：合格且未提交的 Alpha 审阅批次；`today_submission_used=false` | `{"target_id": "候选ID", "reason": "..."}` | 确认 ID 在本次审阅批次内，再复核 BRAIN 并尝试占用当日名额。审阅批次由 `ALPHA_SUBMISSION_REVIEW_LIMIT` 限制，其他合格 Alpha 继续保留。 |
 | 手动执行 `probe` / `connectivity_check` | [prompts/probe.txt](prompts/probe.txt) | `{"task":"connectivity check"}` | `{"ok":true}` | 只验证模型通路，不连接 BRAIN，也不启动研究。 |
@@ -89,6 +89,6 @@ flowchart LR
 - SQLite 保存任务、候选、模型复盘决策、参数搜索阶段、冷却时间和提交占位。
 - `alpha_libraries/candidates/<candidate_id>.json` 保存每个已接收候选的假设、公式、参数、状态和回测结果；未通过的结果也保留。
 - `alpha_libraries/wq_<alpha_id>.md` 保存通过 BRAIN 检查或已提交的 Alpha 思路、公式和结果；`eligible_alphas.json` 汇总资格与提交状态。
-- 控制台和 `research_workflow/logs/workflow.log` 记录方向、模型调用阶段、提示词文件哈希、回测指标、逐项检查及提交状态。文件日志还保存 DEBUG 级别的模型输入输出。
+- 控制台和 `research_workflow/logs/workflow_<启动时间>_<进程号>.log` 记录方向、模型调用阶段、提示词文件哈希、回测指标、逐项检查及提交状态。每次启动使用新文件，文件日志还保存 DEBUG 级别的模型输入输出。
 
 完整配置和启动命令见 [README.md](README.md)。
