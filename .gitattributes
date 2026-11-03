@@ -1,0 +1,2 @@
+# Keep repository text files consistent across Windows and WSL.
+* text=auto eol=lf

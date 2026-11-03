@@ -1,0 +1,56 @@
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+config.env
+config.env.*
+!config.env.example
+.mcp.json
+*.pem
+*.key
+
+# Research data, generated alpha records, and database state
+/alpha_libraries/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.db3
+*.db3-*
+
+# Runtime logs and temporary files
+logs/
+*.log
+*.log.*
+*.pid
+*.tmp
+*.temp
+
+# Python caches, environments, and build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Separate third-party Git checkouts
+/QuantGPT/
+/wqb/
