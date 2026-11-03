@@ -4,6 +4,8 @@
 
 ## 工作方式
 
+完整的 Mermaid 工作流图、五类模型调用的输入输出及各自使用的提示词文件，见 [WORKFLOW.md](WORKFLOW.md)。
+
 1. 模型按研究方向生成带经济假设的 FASTEXPR 模板、一个固定的 `Period` 默认值，以及最多两个额外参数及其离散候选值。程序依次测试 `ALPHA_PERIOD_GRID`（默认 `30,60,90`）与模型给出的 Period 值，去重后逐个发送 BRAIN；所有其他参数先用默认值。
 2. workflow 校验基本格式、跨轮去重，并可选调用 QuantGPT 本地回测。
 3. BRAIN 模拟完成后读取其 IS 检查。所有现有 IS 检查均为 `PASS` 时，立即在 `alpha_libraries/wq_<alpha_id>.md` 保存思路、公式、设置和结果。
@@ -71,5 +73,7 @@ wsl -d Ubuntu-24.04 -- bash -lc 'cd /mnt/d/Project/QR/WorldQuant-Alpha && python
 ## 限流与恢复
 
 对 BRAIN 的 429/503 读取 `Retry-After`（秒数或 HTTP 日期），将冷却时间持久化。模拟轮询也遵循响应头。没有公开证实适用于所有 BRAIN 账号的固定每日模拟额度，因此本地预算是自设上限，平台响应优先。提交 POST 的结果不明确时只回查，不盲目重试。
+
+`ALPHA_MAX_CONCURRENT_SIMULATIONS` 控制同时在 BRAIN 运行的模拟数量，默认 **3**。一次工作流推进会依次填满可用槽位，并分别轮询到期任务；这是多个服务器端回测同时在途，HTTP 请求本身依次发送。单工作流进程下，槽位统计覆盖同一 SQLite 数据库中的所有研究任务；POST 结果不明确的 `unknown` 候选也暂占槽位，避免误超额。BRAIN 返回并发限流时仍按 `Retry-After` 退让。该默认值来自当前账户的实测，其他账户可在配置文件中调整。
 
 首次连接真实账号前，需要用该账号核对可用 region、universe、字段、算子和提交检查。当前生成提示词仅列常见字段，BRAIN 仍是最终语法与结果判定来源。

@@ -92,6 +92,7 @@ class Config:
     auto_submit: bool = field(default_factory=lambda: os.getenv("WQ_AUTO_SUBMIT", "1") == "1")
     batch_size: int = field(default_factory=lambda: int(os.getenv("ALPHA_BATCH_SIZE", "3")))
     max_simulations_day: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_SIMULATIONS_DAY", "20")))
+    max_concurrent_simulations: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_CONCURRENT_SIMULATIONS", "3")))
     max_rounds: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_ROUNDS", "0")))
     max_pending: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_PENDING", "30")))
     period_grid: tuple[int, ...] = field(default_factory=lambda: tuple(

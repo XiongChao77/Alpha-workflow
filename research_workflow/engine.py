@@ -97,6 +97,8 @@ def valid_expression(expression: str) -> bool:
 
 class Engine:
     def __init__(self, config, store, generator, judge, brain, quantgpt=None):
+        if config.max_concurrent_simulations < 1:
+            raise ValueError("ALPHA_MAX_CONCURRENT_SIMULATIONS must be positive")
         self.config = config
         self.store = store
         self.generator = generator
@@ -116,6 +118,61 @@ class Engine:
         start = midnight.astimezone(timezone.utc).isoformat()
         row = self.store.one("SELECT COUNT(*) AS n FROM candidates WHERE simulated_at>=?", (start,))
         return row["n"]
+
+    def _inflight_simulations(self):
+        """Reserve slots for POSTs whose outcome could still be active."""
+        row = self.store.one("SELECT COUNT(*) AS n FROM candidates WHERE status IN "
+                             "('starting','simulating','unknown')")
+        return row["n"]
+
+    def _advance_ready_candidates(self, candidates):
+        ready = [candidate for candidate in candidates
+                 if not candidate["not_before"] or candidate["not_before"] <= now()]
+        results = []
+        max_operations = self.config.max_concurrent_simulations
+        handled = set()
+
+        # Local prefilter does not consume a BRAIN simulation slot.
+        for candidate in ready:
+            if len(results) >= max_operations:
+                break
+            if candidate["status"] == "local_wait" or (
+                candidate["status"] == "queued" and self.quantgpt and not candidate["quantgpt_task_id"]
+            ):
+                if self.store.cooling("quantgpt"):
+                    continue
+                results.append(self._advance_candidate(candidate))
+                handled.add(candidate["id"])
+                if self.store.cooling("quantgpt"):
+                    break
+
+        # Poll each due simulation once; a completed one releases its slot.
+        for candidate in ready:
+            if len(results) >= max_operations or self.store.cooling("brain"):
+                break
+            if candidate["id"] not in handled and candidate["status"] in {"simulating", "checking"}:
+                results.append(self._advance_candidate(candidate))
+                handled.add(candidate["id"])
+
+        # Fill remaining BRAIN slots with queued simulations in the same step.
+        for candidate in ready:
+            if candidate["id"] in handled or candidate["status"] != "queued":
+                continue
+            if self.quantgpt and not candidate["quantgpt_task_id"]:
+                continue
+            if self.store.cooling("brain") or self._today_simulations() >= self.config.max_simulations_day:
+                break
+            in_flight = self._inflight_simulations()
+            if in_flight >= self.config.max_concurrent_simulations:
+                break
+            result = self._advance_candidate(candidate)
+            results.append(result)
+            handled.add(candidate["id"])
+            log.info("BRAIN 并发槽位 in_flight=%s limit=%s", self._inflight_simulations(),
+                     self.config.max_concurrent_simulations)
+            if self.store.cooling("brain"):
+                break
+        return results
 
     def _summary(self, run_id, family_id=None):
         if family_id is None:
@@ -301,15 +358,9 @@ class Engine:
             return submission
 
         candidates = self.store.all("SELECT * FROM candidates WHERE run_id=? AND status IN ('simulating','checking','local_wait','queued') ORDER BY created_at,id", (run_id,))
-        ready = next((c for c in candidates if not c["not_before"] or c["not_before"] <= now()), None)
-        if ready and ready["status"] in {"simulating", "checking", "local_wait"}:
-            if ready["status"] == "local_wait" and self.store.cooling("quantgpt"):
-                return "QuantGPT cooling"
-            return self._advance_candidate(ready)
-        if ready and ready["status"] == "queued" and self._today_simulations() < self.config.max_simulations_day:
-            if self.quantgpt and not ready["quantgpt_task_id"] and self.store.cooling("quantgpt"):
-                return "QuantGPT cooling"
-            return self._advance_candidate(ready)
+        progressed = self._advance_ready_candidates(candidates)
+        if progressed:
+            return " | ".join(progressed)
 
         pending_count = len(candidates)
         if not candidates:
@@ -485,7 +536,9 @@ class Engine:
         return None
 
     def _advance_candidate(self, candidate):
-        if self.store.cooling("brain") and candidate["status"] != "local_wait":
+        if self.store.cooling("brain") and candidate["status"] not in {"local_wait"} and not (
+            candidate["status"] == "queued" and self.quantgpt and not candidate["quantgpt_task_id"]
+        ):
             return "BRAIN cooling"
         status = candidate["status"]
         try:

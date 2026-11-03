@@ -22,6 +22,12 @@ class Generator:
         return [{"hypothesis": "High volume reversal", "expression": "-rank(close / ts_mean(close, 5))"}]
 
 
+class BatchGenerator:
+    def generate(self, context):
+        return [{"hypothesis": f"Idea {period}", "expression": f"rank(ts_mean(close, {period}))"}
+                for period in (5, 10, 20)]
+
+
 class Judge:
     def decide(self, context):
         candidate = next(c for c in context["history"] if c["status"] == "passed")
@@ -285,6 +291,45 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(index["submitted_total"], 1)
         self.assertEqual(index["submitted_today"], 1)
         self.assertEqual(sum(record["submitted"] for record in index["alphas"]), 1)
+
+    def test_default_three_simulation_slots_fill_in_one_step(self):
+        brain = Brain()
+        engine = Engine(self.config, self.store, BatchGenerator(), FamilyJudge(), brain)
+        self.assertIn("generated 3", engine.step(self.run_id))
+        result = engine.step(self.run_id)
+        self.assertEqual(result.count("BRAIN simulation started"), 3)
+        self.assertEqual(brain.starts, 3)
+        self.assertEqual(self.store.one("SELECT COUNT(*) AS n FROM candidates WHERE status='simulating'")["n"], 3)
+
+    def test_completed_simulation_frees_slot_for_queued_candidate(self):
+        config = replace(self.config, max_concurrent_simulations=2)
+        brain = Brain()
+        engine = Engine(config, self.store, BatchGenerator(), FamilyJudge(), brain)
+        engine.step(self.run_id)
+        engine.step(self.run_id)
+        self.assertEqual(brain.starts, 2)
+        result = engine.step(self.run_id)
+        self.assertIn("BRAIN simulation started", result)
+        self.assertEqual(brain.starts, 3)
+        self.assertEqual(engine._inflight_simulations(), 1)
+
+    def test_configured_slot_limit_counts_other_runs(self):
+        other_run = self.store.create_run("another objective", "another direction")
+        other_id = self.store.add_candidate(other_run, 1, "old", "rank(open)", self.config.settings())
+        self.store.update_candidate(other_id, status="simulating", simulation_url="https://api.worldquantbrain.com/simulations/other")
+        config = replace(self.config, max_concurrent_simulations=2)
+        brain = Brain()
+        engine = Engine(config, self.store, BatchGenerator(), FamilyJudge(), brain)
+        engine.step(self.run_id)
+        result = engine.step(self.run_id)
+        self.assertEqual(result.count("BRAIN simulation started"), 1)
+        self.assertEqual(brain.starts, 1)
+        self.assertEqual(engine._inflight_simulations(), 2)
+
+    def test_invalid_simulation_slot_limit_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "ALPHA_MAX_CONCURRENT_SIMULATIONS"):
+            Engine(replace(self.config, max_concurrent_simulations=0), self.store,
+                   Generator(), Judge(), Brain())
 
     def test_submission_counts_are_independent_of_current_eligibility(self):
         self.assertTrue(self.store.reserve_submission("primary", "old-candidate", "OLD-ALPHA"))

@@ -52,6 +52,7 @@ def main():
                "disable_response_storage": model.disable_response_storage,
                "brain_credentials_present": bool(config.email and config.password),
                "brain_target": (config.region, config.universe, config.delay),
+               "max_concurrent_simulations": config.max_concurrent_simulations,
                "auto_submit": config.auto_submit,
                "quantgpt_enabled": bool(config.quantgpt_url),
                "database": str(config.db_path), "library": str(config.library_dir)})
