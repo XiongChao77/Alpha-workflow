@@ -46,6 +46,12 @@ class ModelConfig:
     probe_prompt_file: Path = PROMPT_DIR / "probe.txt"
     parameter_prompt_file: Path = PROMPT_DIR / "parameter_decide.txt"
     submission_prompt_file: Path = PROMPT_DIR / "select_submission.txt"
+    topic_prompt_file: Path = PROMPT_DIR / "research_topic.txt"
+    directions_prompt_file: Path = PROMPT_DIR / "research_directions.txt"
+    feedback_prompt_file: Path = PROMPT_DIR / "research_feedback.txt"
+    variants_prompt_file: Path = PROMPT_DIR / "alpha_variants.txt"
+    repair_prompt_file: Path = PROMPT_DIR / "alpha_repair.txt"
+    brainstorm_prompt_file: Path = PROMPT_DIR / "topic_brainstorm.txt"
 
 
 def model_config() -> ModelConfig:
@@ -72,7 +78,13 @@ def model_config() -> ModelConfig:
                        Path(os.getenv("LLM_DECIDE_PROMPT_FILE") or PROMPT_DIR / "decide.txt"),
                        Path(os.getenv("LLM_PROBE_PROMPT_FILE") or PROMPT_DIR / "probe.txt"),
                        Path(os.getenv("LLM_PARAMETER_PROMPT_FILE") or PROMPT_DIR / "parameter_decide.txt"),
-                       Path(os.getenv("LLM_SUBMISSION_PROMPT_FILE") or PROMPT_DIR / "select_submission.txt"))
+                       Path(os.getenv("LLM_SUBMISSION_PROMPT_FILE") or PROMPT_DIR / "select_submission.txt"),
+                       Path(os.getenv("LLM_TOPIC_PROMPT_FILE") or PROMPT_DIR / "research_topic.txt"),
+                       Path(os.getenv("LLM_DIRECTIONS_PROMPT_FILE") or PROMPT_DIR / "research_directions.txt"),
+                       Path(os.getenv("LLM_FEEDBACK_PROMPT_FILE") or PROMPT_DIR / "research_feedback.txt"),
+                       Path(os.getenv("LLM_VARIANTS_PROMPT_FILE") or PROMPT_DIR / "alpha_variants.txt"),
+                       Path(os.getenv("LLM_REPAIR_PROMPT_FILE") or PROMPT_DIR / "alpha_repair.txt"),
+                       Path(os.getenv("LLM_BRAINSTORM_PROMPT_FILE") or PROMPT_DIR / "topic_brainstorm.txt"))
 
 
 @dataclass(frozen=True)
@@ -97,7 +109,18 @@ class Config:
     max_pending: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_PENDING", "30")))
     period_grid: tuple[int, ...] = field(default_factory=lambda: tuple(
         int(value.strip()) for value in os.getenv("ALPHA_PERIOD_GRID", "30,60,90").split(",")))
+    allowed_fields: tuple[str, ...] = field(default_factory=lambda: tuple(
+        value.strip() for value in os.getenv("ALPHA_ALLOWED_FIELDS", "open,high,low,close,volume,vwap,returns,adv20").split(",")
+        if value.strip()))
     family_max_stagnant: int = field(default_factory=lambda: int(os.getenv("ALPHA_FAMILY_MAX_STAGNANT", "5")))
+    sharpe_gate: float = field(default_factory=lambda: float(os.getenv("ALPHA_SHARPE_GATE", "1.2")))
+    max_combination_pairs: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_COMBINATION_PAIRS", "2")))
+    combination_weights: tuple[float, ...] = field(default_factory=lambda: tuple(
+        float(value.strip()) for value in os.getenv("ALPHA_COMBINATION_WEIGHTS", "0.25,0.5,0.75").split(",")))
+    max_directions_topic: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_DIRECTIONS_TOPIC", "3")))
+    max_experiments_direction: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_EXPERIMENTS_DIRECTION", "8")))
+    max_repair_attempts: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_REPAIR_ATTEMPTS", "2")))
+    max_experiment_candidates: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_EXPERIMENT_CANDIDATES", "24")))
     submission_review_limit: int = field(default_factory=lambda: int(os.getenv("ALPHA_SUBMISSION_REVIEW_LIMIT", "30")))
     idle_seconds: int = field(default_factory=lambda: int(os.getenv("ALPHA_IDLE_SECONDS", "30")))
     quantgpt_url: str = field(default_factory=lambda: os.getenv("QUANTGPT_URL", "").rstrip("/"))

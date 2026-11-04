@@ -50,6 +50,39 @@ SUBMISSION_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {"target_id": {"type": "string"}, "reason": {"type": "string"}},
     "required": ["target_id", "reason"]}
+TOPIC_SCHEMA = {"type": "object", "additionalProperties": False,
+                "properties": {"title": {"type": "string"}, "objective": {"type": "string"},
+                               "rationale": {"type": "string"}},
+                "required": ["title", "objective", "rationale"]}
+DIRECTIONS_SCHEMA = {"type": "object", "additionalProperties": False,
+                     "properties": {"directions": {"type": "array", "items": {
+                         "type": "object", "additionalProperties": False,
+                         "properties": {"title": {"type": "string"}, "hypothesis": {"type": "string"},
+                                        "mechanism": {"type": "string"}},
+                         "required": ["title", "hypothesis", "mechanism"]}}},
+                     "required": ["directions"]}
+FEEDBACK_SCHEMA = {"type": "object", "additionalProperties": False,
+                   "properties": {"action": {"type": "string", "enum": ["EXPLORE_PARAM2", "ITERATE", "SWITCH_DIRECTION", "COMPLETE_TOPIC"]},
+                                  "reason": {"type": "string"}, "next_goal": {"type": "string"},
+                                  "conclusion": {"type": "string"},
+                                  "optimized_candidates": {"type": "array", "maxItems": 2, "items": {
+                                      "type": "object", "additionalProperties": False,
+                                      "properties": {"parent_candidate_id": {"type": "string"},
+                                                     "hypothesis": {"type": "string"},
+                                                     "expression_template": {"type": "string"},
+                                                     "period": {"type": "object", "additionalProperties": False,
+                                                                "properties": {"name": {"type": "string"}, "default": {"type": "integer"}},
+                                                                "required": ["name", "default"]},
+                                                     "parameters": GENERATE_SCHEMA["properties"]["candidates"]["items"]["properties"]["parameters"]},
+                                      "required": ["parent_candidate_id", "hypothesis", "expression_template", "period", "parameters"]}}},
+                   "required": ["action", "reason", "next_goal", "conclusion", "optimized_candidates"]}
+REPAIR_SCHEMA = {"type": "object", "additionalProperties": False,
+                 "properties": {"hypothesis": {"type": "string"}, "expression": {"type": "string"},
+                                "reason": {"type": "string"}},
+                 "required": ["hypothesis", "expression", "reason"]}
+BRAINSTORM_SCHEMA = {"type": "object", "additionalProperties": False,
+                     "properties": {"response": {"type": "string"}, "topic": TOPIC_SCHEMA},
+                     "required": ["response", "topic"]}
 
 
 class LLM:
@@ -244,4 +277,82 @@ class LLM:
             raise ValueError("Submission selection requires target_id")
         if not isinstance(result.get("reason"), str) or not result["reason"].strip():
             raise ValueError("Submission selection requires reason")
+        return result
+
+    def generate_topic(self, context: dict) -> dict:
+        result = self._call(self._prompt(self.config.topic_prompt_file), context, TOPIC_SCHEMA, "research_topic")
+        if any(not isinstance(result.get(key), str) or not result[key].strip()
+               for key in ("title", "objective", "rationale")):
+            raise ValueError("Topic needs title, objective and rationale")
+        return result
+
+    def propose_directions(self, context: dict) -> list[dict]:
+        result = self._call(self._prompt(self.config.directions_prompt_file), context,
+                            DIRECTIONS_SCHEMA, "research_directions")
+        items = result.get("directions")
+        if not isinstance(items, list) or not 1 <= len(items) <= context["max_directions"]:
+            raise ValueError("Invalid direction count")
+        for item in items:
+            if not isinstance(item, dict) or any(not isinstance(item.get(key), str) or not item[key].strip()
+                                                 for key in ("title", "hypothesis", "mechanism")):
+                raise ValueError("Each direction needs title, hypothesis and mechanism")
+        return items
+
+    def analyze_batch(self, context: dict) -> dict:
+        result = self._call(self._prompt(self.config.feedback_prompt_file), context,
+                            FEEDBACK_SCHEMA, "research_feedback")
+        if result.get("action") not in {"EXPLORE_PARAM2", "ITERATE", "SWITCH_DIRECTION", "COMPLETE_TOPIC"}:
+            raise ValueError("Invalid batch decision action")
+        if any(not isinstance(result.get(key), str) for key in ("reason", "next_goal", "conclusion")) or not result["reason"].strip():
+            raise ValueError("Batch decision needs reason and string fields")
+        candidates = result.get("optimized_candidates", [])
+        if not isinstance(candidates, list) or len(candidates) > 2:
+            raise ValueError("Optimized candidates must contain at most two formulas")
+        if result["action"] == "ITERATE" and not candidates:
+            raise ValueError("ITERATE requires optimized_candidates")
+        allowed = {candidate["id"] for candidate in context["statistics"]["candidates"]}
+        normalized = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or candidate.get("parent_candidate_id") not in allowed:
+                raise ValueError("Optimized candidate must reference a candidate in this experiment")
+            hypothesis = candidate.get("hypothesis")
+            if not isinstance(hypothesis, str) or not hypothesis.strip():
+                raise ValueError("Optimized candidate needs a hypothesis")
+            normalized.append({"parent_candidate_id": candidate["parent_candidate_id"],
+                               "hypothesis": hypothesis.strip(), **normalize_plan(candidate)})
+        if result["action"] != "ITERATE" and normalized:
+            raise ValueError("Only ITERATE may contain optimized candidates")
+        result["optimized_candidates"] = normalized
+        return result
+
+    def generate_variants(self, context: dict) -> list[dict]:
+        result = self._call(self._prompt(self.config.variants_prompt_file), context,
+                            GENERATE_SCHEMA, "alpha_variants")
+        items = result.get("candidates")
+        if not isinstance(items, list) or not 1 <= len(items) <= context["requested_count"]:
+            raise ValueError("Invalid structural variant count")
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("hypothesis"), str) or not item["hypothesis"].strip():
+                raise ValueError("Variant needs a hypothesis")
+            normalized.append({"hypothesis": item["hypothesis"].strip(), **normalize_plan(item)})
+        return normalized
+
+    def repair_expression(self, context: dict) -> dict:
+        result = self._call(self._prompt(self.config.repair_prompt_file), context,
+                            REPAIR_SCHEMA, "alpha_repair")
+        if any(not isinstance(result.get(key), str) or not result[key].strip()
+               for key in ("hypothesis", "expression", "reason")):
+            raise ValueError("Repair needs hypothesis, expression and reason")
+        return result
+
+    def brainstorm_topic(self, context: dict) -> dict:
+        result = self._call(self._prompt(self.config.brainstorm_prompt_file), context,
+                            BRAINSTORM_SCHEMA, "topic_brainstorm")
+        if not isinstance(result.get("response"), str) or not result["response"].strip():
+            raise ValueError("Brainstorm needs a response")
+        topic = result.get("topic")
+        if not isinstance(topic, dict) or any(not isinstance(topic.get(key), str) or not topic[key].strip()
+                                             for key in ("title", "objective", "rationale")):
+            raise ValueError("Brainstorm needs a proposed topic")
         return result

@@ -31,9 +31,14 @@ def export_candidate(directory: Path, candidate: dict, submission: dict | None =
         "raw_result": result if candidate["simulated_at"] else None,
     }
     record = {
-        "schema_version": 2,
+        "schema_version": 3,
         "candidate_id": candidate_id,
         "run_id": candidate["run_id"],
+        "topic_id": candidate.get("topic_id"),
+        "direction_id": candidate.get("direction_id"),
+        "experiment_id": candidate.get("experiment_id"),
+        "variant_index": candidate.get("variant_index"),
+        "repair_attempts": candidate.get("repair_attempts", 0),
         "family_id": candidate.get("family_id") or candidate_id,
         "round": candidate["round"],
         "parent_candidate_id": candidate.get("parent_candidate_id"),
@@ -115,6 +120,8 @@ def eligible_records(store):
         submitted = _confirmed_submission(submission)
         records.append({
             "alpha_id": alpha_id, "candidate_id": candidate["id"], "run_id": candidate["run_id"],
+            "topic_id": candidate.get("topic_id"), "direction_id": candidate.get("direction_id"),
+            "experiment_id": candidate.get("experiment_id"),
             "family_id": family_ids.get(candidate["id"], candidate["id"]),
             "hypothesis": candidate["hypothesis"], "expression": candidate["expression"],
             "parameter_values": json.loads(candidate.get("parameter_values") or "{}"),
@@ -124,6 +131,8 @@ def eligible_records(store):
             "submission_day": submission["day"] if submission else None,
             "submitted_at": submission.get("submitted_at") if submission else None,
             "submission_uncertain": bool(submission and submission["status"] == "uncertain"),
+            "component_candidate_ids": store.component_ids(candidate["id"]),
+            "component_already_used": store.components_used(candidate["id"]),
         })
     return records
 
@@ -172,13 +181,21 @@ def archive(directory: Path, candidate: dict, platform: dict, stage: str, decisi
     summary = platform.get("is") or result.get("is") or {}
     lines = [f"# WorldQuant Alpha {alpha_id}", "", f"- 状态：{stage}",
              f"- 更新：{datetime.now(CST).isoformat(timespec='seconds')}",
-             f"- 研究任务：{candidate['run_id']}", f"- 候选编号：{candidate['id']}", "",
+             f"- 研究任务：{candidate['run_id']}",
+             f"- Topic / Direction / Experiment：{candidate.get('topic_id')} / {candidate.get('direction_id')} / {candidate.get('experiment_id')}",
+             f"- 候选编号：{candidate['id']}", "",
              "## 因子思路", "", candidate["hypothesis"], "", "## FASTEXPR 公式", "", "```text",
              candidate["expression"], "```", "", "## BRAIN 设置", "", "```json",
              json.dumps(settings, ensure_ascii=False, indent=2), "```", "", "## 平台结果", "",
              f"- Sharpe：{summary.get('sharpe')}", f"- Fitness：{summary.get('fitness')}",
              f"- Returns：{summary.get('returns')}", f"- Turnover：{summary.get('turnover')}",
              f"- 平台状态：{platform.get('status', '')}", "", "### 检查项", ""]
+    if candidate.get("origin_action") == "COMBINATION":
+        components = json.loads(candidate.get("parameter_values") or "{}")
+        lines.extend(["", "## 组合来源", "",
+                      f"- 父因子：{components.get('left_id')} + {components.get('right_id')}",
+                      f"- 左侧权重：{components.get('weight_left')}",
+                      "- 组合设置：见本文件 BRAIN 设置；父因子设置可与其不同", ""])
     lines.extend(f"- {c.get('name', '?')}: {c.get('result', '?')} (value={c.get('value', '')}, limit={c.get('limit', '')})" for c in checks)
     if decision:
         lines.extend(["", "## 模型提交判断", "", decision.get("reason", "")])

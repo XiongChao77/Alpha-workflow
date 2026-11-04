@@ -1,3 +1,4 @@
+import json
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +23,19 @@ class FakeTransport:
 
 
 class LLMCompatibilityTests(unittest.TestCase):
+    def test_batch_optimization_returns_direction_and_formula_in_one_call(self):
+        response = {"action": "ITERATE", "reason": "Invert and smooth", "next_goal": "test a stable inverse",
+                    "conclusion": "Original sign was wrong", "optimized_candidates": [{
+                        "parent_candidate_id": "candidate1", "hypothesis": "Inverse impact",
+                        "expression_template": "-rank(ts_mean(returns,{Period}))",
+                        "period": {"name": "Period", "default": 45}, "parameters": []}]}
+        fake = FakeTransport({"choices": [{"message": {"content": json.dumps(response)}}]})
+        model = LLM(ModelConfig("openai", "test-model", "fake-key", "https://example.test/v1",
+                                "chat_completions"), fake)
+        result = model.analyze_batch({"statistics": {"candidates": [{"id": "candidate1"}]}})
+        self.assertEqual(result["optimized_candidates"][0]["parent_candidate_id"], "candidate1")
+        self.assertEqual(len(fake.calls), 1)
+
     def test_third_party_chat_completions_base_url(self):
         fake = FakeTransport({"choices": [{"message": {"content": '{"action":"NEW_DIRECTION"}'}}]})
         config = ModelConfig("openai", "gpt-6.1-sol", "fake-key", "https://example.test/v1",

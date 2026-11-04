@@ -78,4 +78,4 @@ def sharpe(candidate):
 def best_candidate(candidates):
     eligible = [(sharpe(candidate), candidate) for candidate in candidates]
     eligible = [(score, candidate) for score, candidate in eligible if score is not None]
-    return max(eligible, key=lambda item: item[0])[1] if eligible else None
+    return max(eligible, key=lambda item: abs(item[0]))[1] if eligible else None

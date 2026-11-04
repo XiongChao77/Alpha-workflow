@@ -75,6 +75,20 @@ class Store:
                     account TEXT NOT NULL, day TEXT NOT NULL, candidate_id TEXT NOT NULL,
                     alpha_id TEXT NOT NULL, status TEXT NOT NULL, detail TEXT,
                     created_at TEXT NOT NULL, submitted_at TEXT, PRIMARY KEY(day));
+                CREATE TABLE IF NOT EXISTS submission_uses (
+                    component_id TEXT PRIMARY KEY, submitted_candidate_id TEXT NOT NULL,
+                    day TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS combination_pairs (
+                    id TEXT PRIMARY KEY, direction_id TEXT NOT NULL, experiment_id TEXT NOT NULL,
+                    left_id TEXT NOT NULL, right_id TEXT NOT NULL, status TEXT NOT NULL,
+                    created_at TEXT NOT NULL, evaluated_at TEXT,
+                    UNIQUE(direction_id,left_id,right_id));
+                CREATE TABLE IF NOT EXISTS combination_members (
+                    candidate_id TEXT PRIMARY KEY, pair_id TEXT NOT NULL, weight_left REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS combination_attempts (
+                    pair_id TEXT NOT NULL, parent_id TEXT NOT NULL, improved INTEGER NOT NULL,
+                    parent_fitness REAL, best_fitness REAL, created_at TEXT NOT NULL,
+                    PRIMARY KEY(pair_id,parent_id));
                 CREATE TABLE IF NOT EXISTS cooldowns (
                     service TEXT PRIMARY KEY, not_before TEXT NOT NULL, reason TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS parameter_searches (
@@ -82,6 +96,35 @@ class Store:
                     period_default INTEGER NOT NULL, parameters TEXT NOT NULL,
                     stage TEXT NOT NULL, stage_trials TEXT NOT NULL,
                     selected_period INTEGER, selected_params TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS topics (
+                    id TEXT PRIMARY KEY, run_id TEXT UNIQUE, title TEXT NOT NULL, objective TEXT NOT NULL,
+                    rationale TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL, status TEXT NOT NULL, summary TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS ix_topics_queue ON topics(status,priority,created_at);
+                CREATE TABLE IF NOT EXISTS topic_discussions (
+                    id TEXT PRIMARY KEY, status TEXT NOT NULL, proposal TEXT,
+                    topic_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS topic_messages (
+                    id TEXT PRIMARY KEY, discussion_id TEXT NOT NULL, role TEXT NOT NULL,
+                    content TEXT NOT NULL, proposal TEXT, created_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS ix_topic_messages_discussion ON topic_messages(discussion_id,created_at);
+                CREATE TABLE IF NOT EXISTS directions (
+                    id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, title TEXT NOT NULL,
+                    hypothesis TEXT NOT NULL, mechanism TEXT NOT NULL, status TEXT NOT NULL,
+                    iteration INTEGER NOT NULL DEFAULT 0, conclusion TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS ix_directions_topic ON directions(topic_id,status);
+                CREATE TABLE IF NOT EXISTS experiments (
+                    id TEXT PRIMARY KEY, direction_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                    goal TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+                    plans TEXT NOT NULL, feedback_id TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS ix_experiments_direction ON experiments(direction_id,status);
+                CREATE TABLE IF NOT EXISTS feedback (
+                    id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, stage TEXT NOT NULL,
+                    statistics TEXT NOT NULL, decision TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS ix_feedback_experiment ON feedback(experiment_id,created_at);
             """)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(candidates)")}
             if "parent_candidate_id" not in columns:
@@ -90,9 +133,19 @@ class Store:
                 db.execute("ALTER TABLE candidates ADD COLUMN origin_action TEXT")
             if "parameter_values" not in columns:
                 db.execute("ALTER TABLE candidates ADD COLUMN parameter_values TEXT")
+            for name, ddl in (("topic_id", "TEXT"), ("direction_id", "TEXT"),
+                              ("experiment_id", "TEXT"), ("variant_index", "INTEGER"),
+                              ("repair_attempts", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE candidates ADD COLUMN {name} {ddl}")
             submission_columns = {row["name"] for row in db.execute("PRAGMA table_info(submissions)")}
             if "submitted_at" not in submission_columns:
                 db.execute("ALTER TABLE submissions ADD COLUMN submitted_at TEXT")
+            for item in db.execute("SELECT candidate_id,alpha_id,day FROM submissions").fetchall():
+                db.execute("INSERT OR IGNORE INTO submission_uses VALUES (?,?,?)",
+                           (item["candidate_id"], item["candidate_id"], item["day"]))
+                db.execute("INSERT OR IGNORE INTO submission_uses VALUES (?,?,?)",
+                           ("alpha:" + item["alpha_id"], item["candidate_id"], item["day"]))
             # Older TUNE records predate explicit lineage; connect them to the
             # nearest earlier version of the same formula within their run.
             legacy_tunes = db.execute(
@@ -158,15 +211,18 @@ class Store:
 
     def add_candidate(self, run_id: str, round_number: int, hypothesis: str, expression: str, settings: dict,
                       parent_candidate_id: str | None = None, origin_action: str = "GENERATE",
-                      parameter_values: dict | None = None) -> str | None:
+                      parameter_values: dict | None = None, topic_id: str | None = None,
+                      direction_id: str | None = None, experiment_id: str | None = None,
+                      variant_index: int | None = None, repair_attempts: int = 0) -> str | None:
         candidate_id = uuid.uuid4().hex[:12]
         expression = expression.strip()
         key = "".join(expression.split()).lower()
         with self.tx() as db:
-            result = db.execute("INSERT OR IGNORE INTO candidates (id,run_id,round,hypothesis,expression,expression_key,settings,status,parent_candidate_id,origin_action,parameter_values,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            result = db.execute("INSERT OR IGNORE INTO candidates (id,run_id,round,hypothesis,expression,expression_key,settings,status,parent_candidate_id,origin_action,parameter_values,topic_id,direction_id,experiment_id,variant_index,repair_attempts,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (candidate_id, run_id, round_number, hypothesis, expression, key,
                                  json.dumps(settings, sort_keys=True), "queued", parent_candidate_id, origin_action,
-                                 json.dumps(parameter_values, sort_keys=True) if parameter_values else None, now()))
+                                 json.dumps(parameter_values, sort_keys=True) if parameter_values else None,
+                                 topic_id, direction_id, experiment_id, variant_index, repair_attempts, now()))
             return candidate_id if result.rowcount else None
 
     def create_parameter_family(self, run_id, round_number, hypothesis, plan, trials, settings):
@@ -251,11 +307,56 @@ class Store:
     def submission_today(self, account: str) -> dict | None:
         return self.one("SELECT * FROM submissions WHERE day=?", (today(),))
 
+    @staticmethod
+    def _components(db, candidate_id, seen=None):
+        seen = seen or set()
+        if candidate_id in seen:
+            raise ValueError("Cycle in combination lineage")
+        seen.add(candidate_id)
+        member = db.execute("SELECT pair_id FROM combination_members WHERE candidate_id=?", (candidate_id,)).fetchone()
+        if member:
+            pair = db.execute("SELECT left_id,right_id FROM combination_pairs WHERE id=?", (member["pair_id"],)).fetchone()
+            return sorted(set(Store._components(db, pair["left_id"], seen.copy()) +
+                              Store._components(db, pair["right_id"], seen.copy())))
+        parent = db.execute("SELECT parent_candidate_id FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        if parent and parent["parent_candidate_id"]:
+            inherited = Store._components(db, parent["parent_candidate_id"], seen)
+            if len(inherited) > 1:
+                return inherited
+        return [candidate_id]
+
+    def component_ids(self, candidate_id):
+        with self.tx() as db:
+            return self._components(db, candidate_id)
+
+    @staticmethod
+    def _component_keys(db, candidate_id):
+        keys = []
+        for component in Store._components(db, candidate_id):
+            keys.append(component)
+            row = db.execute("SELECT alpha_id FROM candidates WHERE id=?", (component,)).fetchone()
+            if row and row["alpha_id"]:
+                keys.append("alpha:" + row["alpha_id"])
+        return list(dict.fromkeys(keys))
+
+    def components_used(self, candidate_id):
+        with self.tx() as db:
+            return any(db.execute("SELECT 1 FROM submission_uses WHERE component_id=?", (item,)).fetchone()
+                       for item in self._component_keys(db, candidate_id))
+
     def reserve_submission(self, account: str, candidate_id: str, alpha_id: str, day: str | None = None) -> bool:
         day = day or today()
         with self.tx() as db:
+            db.execute("BEGIN IMMEDIATE")
+            components = self._component_keys(db, candidate_id)
+            if any(db.execute("SELECT 1 FROM submission_uses WHERE component_id=?", (item,)).fetchone()
+                   for item in components):
+                return False
             result = db.execute("INSERT OR IGNORE INTO submissions (account,day,candidate_id,alpha_id,status,detail,created_at) VALUES (?,?,?,?,?,?,?)",
                                 (account, day, candidate_id, alpha_id, "reserved", None, now()))
+            if result.rowcount:
+                for item in components:
+                    db.execute("INSERT INTO submission_uses VALUES (?,?,?)", (item, candidate_id, day))
             return result.rowcount == 1
 
     def mark_submission_sent(self, account: str, day: str):

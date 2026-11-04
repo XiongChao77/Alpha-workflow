@@ -201,6 +201,14 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("平台 ACTIVE", record.read_text(encoding="utf-8"))
         self.assertIn("All reported IS checks passed", record.read_text(encoding="utf-8"))
 
+    def test_simulation_log_shows_beijing_day_sequence(self):
+        engine = Engine(self.config, self.store, Generator(), Judge(), Brain())
+        engine.step(self.run_id)
+        with self.assertLogs("research_workflow.engine", level="INFO") as captured:
+            engine.step(self.run_id)
+        self.assertTrue(any("今日第1次测试" in line for line in captured.output))
+        self.assertTrue(any("candidate=" in line for line in captured.output))
+
     def test_failed_checks_are_exported_as_structured_json(self):
         engine = Engine(self.config, self.store, Generator(), Judge(), FailedChecksBrain())
         for _ in range(4):
@@ -442,7 +450,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(root_record["parameter_search"]["parameters"][0]["name"], "Scale")
         for candidate in period_candidates:
             period = json.loads(candidate["parameter_values"])["Period"]
-            score = 1.2 if period == 60 else 0.8
+            score = 1.3 if period == 60 else 0.8
             self.store.update_candidate(candidate["id"], status="rejected", result={"is": {
                 "sharpe": score, "checks": [{"name": "LOW_FITNESS", "result": "FAIL", "value": 0.3, "limit": 1}]}})
         self.assertIn("PARAM1 search queued", engine.step(self.run_id))
@@ -467,14 +475,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("PARAM2 search completed", engine.step(self.run_id))
         self.assertEqual(self.store.one("SELECT stage FROM parameter_searches")["stage"], "READY")
 
-    def test_period_gate_abandons_family_when_no_sharpe_above_one(self):
+    def test_period_gate_abandons_family_at_absolute_threshold(self):
         engine = Engine(self.config, self.store, ParameterGenerator(), ParameterJudge(), Brain())
         engine.step(self.run_id)
         for candidate in self.store.all("SELECT * FROM candidates"):
             self.store.update_candidate(candidate["id"], status="rejected", result={"is": {
-                "sharpe": 1.0, "checks": [{"name": "LOW_SHARPE", "result": "FAIL", "value": 1, "limit": 1.25}]}})
+                "sharpe": -1.2, "checks": [{"name": "LOW_SHARPE", "result": "FAIL", "value": -1.2, "limit": 1.25}]}})
         self.assertIn("Period gate failed", engine.step(self.run_id))
         self.assertEqual(self.store.one("SELECT stage FROM parameter_searches")["stage"], "ABANDONED")
+
+    def test_negative_sharpe_period_passes_absolute_gate(self):
+        engine = Engine(self.config, self.store, ParameterGenerator(), ParameterJudge(), Brain())
+        engine.step(self.run_id)
+        for candidate in self.store.all("SELECT * FROM candidates"):
+            period = json.loads(candidate["parameter_values"])["Period"]
+            score = -1.3 if period == 60 else 0.7
+            self.store.update_candidate(candidate["id"], status="rejected", result={"is": {"sharpe": score}})
+        self.assertIn("PARAM1 search queued", engine.step(self.run_id))
+        self.assertEqual(self.store.one("SELECT selected_period FROM parameter_searches")["selected_period"], 60)
 
     def test_existing_candidate_is_backfilled_on_next_step(self):
         candidate_id = self.store.add_candidate(self.run_id, 1, "older idea", "rank(volume)", self.config.settings())

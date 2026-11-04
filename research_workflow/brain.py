@@ -55,6 +55,8 @@ class Brain:
             detail = self.get_alpha(alpha)
             data["is"] = detail.get("is", {})
             data["oos"] = detail.get("oos", {})
+            data["alpha_status"] = detail.get("status")
+            data["alpha_message"] = detail.get("message")
         return data, retry_seconds(headers.get("Retry-After"), 10)
 
     def get_alpha(self, alpha_id: str) -> dict:

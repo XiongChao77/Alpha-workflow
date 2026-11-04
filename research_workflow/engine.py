@@ -303,8 +303,12 @@ class Engine:
         searches = {row["family_id"]: row["stage"] for row in self.store.all(
             "SELECT family_id,stage FROM parameter_searches")}
         eligible = [record for record in eligible_records(self.store)
-                    if record["submission_status"] == "not_submitted" and
+                    if record["submission_status"] == "not_submitted" and not record["component_already_used"] and
                     searches.get(record["family_id"], "READY") == "READY"]
+        eligible = [record for record in eligible if not (
+            (experiment := self.store.one("SELECT e.stage,e.status FROM candidates c JOIN experiments e "
+                                          "ON e.id=c.experiment_id WHERE c.id=?", (record["candidate_id"],)))
+            and experiment["status"] != "completed")]
         eligible = eligible[:max(1, self.config.submission_review_limit)]
         if not eligible or not hasattr(self.judge, "choose_submission"):
             return None
@@ -484,11 +488,12 @@ class Engine:
                 continue
             parameters = json.loads(search["parameters"])
             if stage == "PERIOD":
-                passing = [candidate for candidate in trials if sharpe(candidate) is not None and sharpe(candidate) > 1]
+                passing = [candidate for candidate in trials if sharpe(candidate) is not None and abs(sharpe(candidate)) > self.config.sharpe_gate]
                 if not passing:
                     self._set_search_stage(search, "ABANDONED")
-                    log.info("假设族放弃 family_id=%s reason=Period 测试均未达到 Sharpe>1 results=%s",
-                             search["family_id"], [(c["parameter_values"], sharpe(c)) for c in trials])
+                    log.info("假设族放弃 family_id=%s reason=Period 测试均未达到 abs(Sharpe)>%s results=%s",
+                             search["family_id"], self.config.sharpe_gate,
+                             [(c["parameter_values"], sharpe(c)) for c in trials])
                     return f"Period gate failed for family {search['family_id']}"
                 best = best_candidate(passing)
                 selected = json.loads(best["parameter_values"])
@@ -567,7 +572,9 @@ class Engine:
                 self.store.update_candidate(candidate["id"], status="queued", result={"quantgpt": summary})
                 return f"QuantGPT passed: {candidate['id']}"
             if status == "queued":
-                log.info("BRAIN 模拟请求 candidate=%s formula=%s settings=%s", candidate["id"],
+                daily_test_number = self._today_simulations() + 1
+                log.info("BRAIN 模拟请求 今日第%s次测试 date=%s candidate=%s formula=%s settings=%s",
+                         daily_test_number, today(), candidate["id"],
                          candidate["expression"], candidate["settings"])
                 # Claim before POST. A crash between POST and Location persistence leaves
                 # an unknown outcome, which is intentionally not submitted again.
@@ -594,7 +601,8 @@ class Engine:
                         self._throttle("brain", exc)
                     return f"simulation outcome unknown: {candidate['id']}"
                 self.store.update_candidate(candidate["id"], status="simulating", simulation_url=location, not_before=self._later(wait))
-                log.info("BRAIN 模拟已启动 candidate=%s poll_after=%ss", candidate["id"], wait)
+                log.info("BRAIN 模拟已启动 今日第%s次测试 candidate=%s poll_after=%ss",
+                         daily_test_number, candidate["id"], wait)
                 return f"BRAIN simulation started: {candidate['id']}"
             if status == "simulating":
                 data, wait = self.brain.poll_simulation(candidate["simulation_url"])
@@ -606,9 +614,10 @@ class Engine:
                 if platform_status == "WARNING":
                     log.info("BRAIN 模拟警告 candidate=%s alpha_id=%s message=%s location=%s；继续轮询",
                              candidate["id"], data.get("alpha_id"), data.get("message"), data.get("location"))
-                if platform_status in {"ERROR", "FAILED"}:
+                if platform_status in {"ERROR", "FAILED"} or str(data.get("alpha_status") or "").upper() in {"ERROR", "FAILED"}:
                     log.warning("BRAIN 模拟失败 candidate=%s status=%s message=%s location=%s",
-                                candidate["id"], platform_status, data.get("message"), data.get("location"))
+                                candidate["id"], data.get("alpha_status") or platform_status,
+                                data.get("alpha_message") or data.get("message"), data.get("location"))
                     self.store.update_candidate(candidate["id"], status="failed", alpha_id=data.get("alpha_id"),
                                                 result=retain_local_result(candidate, data))
                     return f"BRAIN simulation failed: {candidate['id']}"
@@ -764,6 +773,8 @@ class Engine:
         previous = self.store.one("SELECT status FROM submissions WHERE alpha_id=?", (candidate["alpha_id"],))
         if previous:
             return f"alpha already has a submission record: {candidate['alpha_id']} ({previous['status']})"
+        if self.store.components_used(candidate["id"]):
+            return f"factor already used by another submission: {candidate['id']}"
         day = today()
         if not self.store.reserve_submission(self.config.account, candidate["id"], candidate["alpha_id"], day):
             return "daily submission slot already used; continue mining"
