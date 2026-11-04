@@ -1,8 +1,6 @@
-# WorldQuant Alpha 自主研究系统
+# 运行与配置
 
-系统默认按 **Topic → Direction → Experiment** 研究：Research Agent 选择主题和机制、分析整个实验批次；Alpha Agent 生成多个 FASTEXPR 结构并有限修复公式；普通程序展开参数、去重、并发回测、落盘和执行每日提交。研究任务进入队列后，无需研究员在运行中参与。完整流程及各模型提示词的输入输出见 [WORKFLOW.md](WORKFLOW.md)。
-
-项目不依赖 Microsoft RD-Agent，也不修改 QuantGPT 源码。BRAIN 认证、模拟、结果和提交沿用项目现有适配器；`QUANTGPT_URL` 可选用已有 QuantGPT HTTP 本地预筛，留空即可。默认直接对 WorldQuant BRAIN 回测。
+项目概览见 [根目录 README](../README.md)。系统默认按 **Topic → Direction → Experiment** 研究，持续生成、回测和复盘；研究员也可在运行期间通过独立的 `chat` 命令讨论并排队新 Topic。完整流程及各模型提示词的输入输出见 [WORKFLOW.md](WORKFLOW.md)。
 
 ## 配置
 
@@ -42,7 +40,7 @@ python -m research_workflow topic list
 
 每个 Direction 由若干结构不同的公式构成一个实验批次。程序先批量测试 Period；每个 Sharpe 小于 `-1.2` 的候选都会将公式取反，作为同族新候选送 BRAIN 重新回测，后续调参只使用实际测得 Sharpe 大于 `1.2` 的候选。模型随后看到同族原式、反向式、参数和完整结果；决定继续时在**同一次调用**返回优化方向和 1～2 个新假设及 FASTEXPR 模板，程序展开并回测。公式语法、单位、类型错误由 Alpha Agent 最多修复两次。所有候选，包括失败结果，都保留在 SQLite 和 `alpha_libraries/candidates/*.json`。
 
-单因子批次结束时，系统还可从**同一 Direction** 选两个机制和换手不同的候选组合，不要求父因子的回测设置相同。组合使用当前目标配置重新回测，默认测试三个权重 `0.25/0.75`、`0.5/0.5`、`0.75/0.25`；每对因子的三个权重算一次组合尝试。组合最佳 Fitness 未超过某父因子本身的 Fitness，记该父因子一次失败；连续两次失败后不再选它参与新组合。不同设置下的父因子 Fitness 比较只用于配对退出启发式，组合是否合格以其自身的 BRAIN 检查为准。可用 `ALPHA_MAX_COMBINATION_PAIRS`、`ALPHA_COMBINATION_WEIGHTS` 控制组合预算。独立或组合正式提交会原子占用其基础因子，防止任何基础因子被提交两次。
+单因子批次结束时，系统还可从**同一 Direction** 选两个候选组合，按换手差异排序，不要求父因子的回测设置相同。组合使用当前目标配置重新回测，默认测试三个权重 `0.25/0.75`、`0.5/0.5`、`0.75/0.25`；每对因子的三个权重算一次组合尝试。组合最佳 Fitness 未超过某父因子本身的 Fitness，记该父因子一次失败；连续两次失败后不再选它参与新组合。不同设置下的父因子 Fitness 比较只用于配对退出启发式，组合是否合格以其自身的 BRAIN 检查为准。可用 `ALPHA_MAX_COMBINATION_PAIRS`、`ALPHA_COMBINATION_WEIGHTS` 控制组合预算。独立或组合正式提交会原子占用其基础因子，防止任何基础因子被提交两次。
 
 所有通过 BRAIN 检查的因子统一保存在 `alpha_libraries/wq_<alpha_id>.md` 和 `eligible_alphas.json`，标记是否已提交。模型从合格且未提交的因子中选择当日一个；北京时间每天只占用一个正式提交槽位，即使提交响应不明确也不会当天重试另一个。每次向 BRAIN 发起模拟测试时，日志打印北京时间“今日第 N 次测试”和候选 ID；每 10 秒的统计日志打印合格总数、已提交数和今日提交数。
 
