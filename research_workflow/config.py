@@ -109,9 +109,6 @@ class Config:
     max_pending: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_PENDING", "30")))
     period_grid: tuple[int, ...] = field(default_factory=lambda: tuple(
         int(value.strip()) for value in os.getenv("ALPHA_PERIOD_GRID", "30,60,90").split(",")))
-    allowed_fields: tuple[str, ...] = field(default_factory=lambda: tuple(
-        value.strip() for value in os.getenv("ALPHA_ALLOWED_FIELDS", "open,high,low,close,volume,vwap,returns,adv20").split(",")
-        if value.strip()))
     family_max_stagnant: int = field(default_factory=lambda: int(os.getenv("ALPHA_FAMILY_MAX_STAGNANT", "5")))
     sharpe_gate: float = field(default_factory=lambda: float(os.getenv("ALPHA_SHARPE_GATE", "1.2")))
     max_combination_pairs: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_COMBINATION_PAIRS", "2")))
@@ -120,6 +117,7 @@ class Config:
     max_directions_topic: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_DIRECTIONS_TOPIC", "3")))
     max_experiments_direction: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_EXPERIMENTS_DIRECTION", "8")))
     max_repair_attempts: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_REPAIR_ATTEMPTS", "2")))
+    max_invalid_generations: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_INVALID_GENERATIONS", "3")))
     max_experiment_candidates: int = field(default_factory=lambda: int(os.getenv("ALPHA_MAX_EXPERIMENT_CANDIDATES", "24")))
     submission_review_limit: int = field(default_factory=lambda: int(os.getenv("ALPHA_SUBMISSION_REVIEW_LIMIT", "30")))
     idle_seconds: int = field(default_factory=lambda: int(os.getenv("ALPHA_IDLE_SECONDS", "30")))

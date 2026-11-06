@@ -7,7 +7,7 @@ import unittest
 
 from research_workflow.brain import Brain as BrainClient, is_checks_passed
 from research_workflow.config import Config
-from research_workflow.engine import Engine, stagnant_count
+from research_workflow.engine import Engine, stagnant_count, valid_expression
 from research_workflow.library import eligible_counts
 from research_workflow.store import Store, today
 from research_workflow.transport import RemoteError, retry_seconds
@@ -524,6 +524,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(is_checks_passed({}))
         self.assertFalse(is_checks_passed({"checks": [{"result": "PASS"}, {"result": "PENDING"}]}))
         self.assertTrue(is_checks_passed(PASS_IS))
+
+    def test_multistatement_expression_longer_than_500_is_locally_accepted(self):
+        expression = "; ".join(f"part{i} = rank(close)" for i in range(40)) + "; rank(part39)"
+        self.assertGreater(len(expression), 500)
+        self.assertTrue(valid_expression(expression))
 
     def test_retry_after_header(self):
         self.assertEqual(retry_seconds("17"), 17)

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from dataclasses import replace
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 from research_workflow.config import Config, ModelConfig
 from research_workflow.llm import LLM
-from research_workflow.logging_setup import setup_logging
+from research_workflow.logging_setup import conversation_path, setup_logging
 from research_workflow.tests.test_llm import FakeTransport
 from research_workflow.tests.test_workflow import Brain, Generator, Judge
 from research_workflow.engine import Engine
@@ -41,8 +42,16 @@ class LoggingTests(unittest.TestCase):
                 for handler in logging.getLogger("research_workflow").handlers:
                     handler.flush()
                 contents = session_log_path.read_text(encoding="utf-8")
-                self.assertIn("模型输入 stage=connectivity_check", contents)
-                self.assertIn("模型输出 stage=connectivity_check", contents)
+                self.assertRegex(contents, r"模型请求 #\d+ stage=connectivity_check")
+                self.assertRegex(contents, r"模型输入 request_no=\d+ stage=connectivity_check")
+                self.assertRegex(contents, r"模型输出 request_no=\d+ stage=connectivity_check")
+                exchanges = [json.loads(line) for line in conversation_path().read_text(encoding="utf-8").splitlines()]
+                self.assertEqual([event["event"] for event in exchanges], ["request", "completed"])
+                self.assertEqual(exchanges[0]["request_no"], exchanges[1]["request_no"])
+                self.assertEqual(exchanges[0]["stage"], "connectivity_check")
+                self.assertEqual(exchanges[0]["messages"][0]["role"], "system")
+                self.assertIn("ok", exchanges[1]["response"]["choices"][0]["message"]["content"])
+                self.assertNotIn(secret, conversation_path().read_text(encoding="utf-8"))
                 self.assertIn("探索方向", contents)
                 self.assertIn("sharpe", contents)
                 self.assertIn("FITNESS", contents)

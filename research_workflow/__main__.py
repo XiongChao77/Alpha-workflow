@@ -11,7 +11,7 @@ from .engine import Engine
 from .heartbeat import start_heartbeat
 from .llm import LLM
 from .library import export_candidates
-from .logging_setup import setup_logging
+from .logging_setup import conversation_path, setup_logging
 from .quantgpt import QuantGPT
 from .research import AlphaAgent, ResearchAgent, ResearchWorkflow
 from .store import Store
@@ -58,6 +58,7 @@ def main():
     session_log_file = setup_logging(config.log_file, config.log_level)
     log = logging.getLogger(__package__)
     log.info("本次运行日志 path=%s", session_log_file)
+    log.info("模型对话记录 path=%s", conversation_path())
     if command == "check":
         model = model_config()
         print({"model": (model.provider, model.model, bool(model.api_key)),

@@ -49,7 +49,7 @@ def batch_statistics(rows):
     metric_values = defaultdict(list)
     checks = Counter()
     by_structure = defaultdict(list)
-    by_period = defaultdict(list)
+    by_parameter = defaultdict(lambda: defaultdict(list))
     correlation = []
     details = []
     for row in rows:
@@ -69,8 +69,9 @@ def batch_statistics(rows):
         value = sharpe(row)
         if value is not None:
             by_structure[str(row.get("variant_index"))].append(value)
-            if "Period" in params:
-                by_period[str(params["Period"])].append(value)
+            for name, setting in params.items():
+                if not name.startswith("_") and isinstance(setting, (int, float)) and not isinstance(setting, bool):
+                    by_parameter[name][str(setting)].append(value)
         details.append({"id": row["id"], "variant_index": row.get("variant_index"),
                         "parent_candidate_id": row.get("parent_candidate_id"),
                         "origin_action": row.get("origin_action"), "hypothesis": row["hypothesis"],
@@ -85,7 +86,8 @@ def batch_statistics(rows):
             "metrics": {key: distribution(values) for key, values in metric_values.items()},
             "failed_checks": dict(checks),
             "structure_sharpe": {key: distribution(values) for key, values in by_structure.items()},
-            "period_sharpe": {key: distribution(values) for key, values in by_period.items()},
+            "parameter_sharpe": {name: {setting: distribution(values) for setting, values in groups.items()}
+                                 for name, groups in by_parameter.items()},
             "correlation_evidence": correlation or "unavailable; BRAIN supplied no correlation values",
             "candidates": details}
 
@@ -268,7 +270,6 @@ class ResearchWorkflow:
         context = {"topic": topic["title"], "direction": {key: direction[key] for key in
                     ("title", "hypothesis", "mechanism")}, "goal": goal,
                    "requested_count": requested, "settings": self.config.settings(),
-                   "allowed_fields": self.config.allowed_fields,
                    "previous_feedback": self.store.all(
                        "SELECT f.statistics,f.decision FROM feedback f JOIN experiments e ON e.id=f.experiment_id "
                        "WHERE e.direction_id=? ORDER BY f.created_at DESC LIMIT 3", (direction["id"],))}
@@ -279,41 +280,87 @@ class ResearchWorkflow:
         else:
             plans = plans_override
         for index, plan in enumerate(plans):
-            log.info("Alpha 结构变体 direction_id=%s index=%s hypothesis=%s template=%s period=%s parameters=%s",
+            log.info("Alpha 结构变体 direction_id=%s index=%s hypothesis=%s template=%s parameters=%s",
                      direction["id"], index, plan["hypothesis"], plan["expression_template"],
-                     plan["period"]["default"], plan["parameters"])
+                     plan["parameters"])
         experiment_id = uuid.uuid4().hex[:12]
         ordinal = direction["iteration"] + 1
+        legacy = all("period" in plan for plan in plans)
+        initial_stage = "PERIOD" if legacy else "PARAM1"
         trials = []
+        invalid = []
         for index, plan in enumerate(plans):
             defaults = {item["name"]: item["default"] for item in plan["parameters"]}
-            for period in period_values(self.config.period_grid, plan["period"]["default"]):
-                values = {"Period": period, **defaults}
+            if "period" in plan:
+                assignments = ({"Period": value, **defaults}
+                               for value in period_values(self.config.period_grid, plan["period"]["default"]))
+            else:
+                first = plan["parameters"][0]
+                assignments = ({**defaults, first["name"]: value} for value in first["values"])
+            for values in assignments:
                 expression = render_expression(plan["expression_template"], values)
                 if valid_expression(expression):
                     trials.append((index, plan["hypothesis"], expression, values,
                                    plan.get("parent_candidate_id")))
+                else:
+                    reason = ("too long" if len(expression) > 4096 else
+                              "unbalanced parentheses" if expression.count("(") != expression.count(")") else
+                              "unsupported character or malformed expression")
+                    invalid.append({"variant": index, "parameter_values": values,
+                                    "length": len(expression), "reason": reason})
+        if invalid:
+            log.warning("Alpha 本地表达式校验未通过 direction_id=%s rejected=%s", direction["id"], invalid)
         if not trials:
-            self.store.set_cooldown("llm", 300, "no valid expressions")
-            return "no valid expressions"
+            if plans_override is not None:
+                with self.store.tx() as db:
+                    db.execute("UPDATE directions SET status='completed',conclusion=?,updated_at=? WHERE id=?",
+                               ("模型优化公式未通过本地校验，停止重复重放同一方案", now(), direction["id"]))
+                log.warning("优化方案已停止重放 direction_id=%s reason=no valid expressions", direction["id"])
+                return "invalid optimized expressions; direction completed"
+            return self._generation_failed(direction, "no valid expressions")
         accepted = 0
         with self.store.tx() as db:
             db.execute("INSERT INTO experiments VALUES (?,?,?,?,?,?,?,?,?,?)",
-                       (experiment_id, direction["id"], ordinal, goal, "PERIOD", "active",
+                       (experiment_id, direction["id"], ordinal, goal, initial_stage, "active",
                         json.dumps(plans, ensure_ascii=False), None, now(), now()))
             db.execute("UPDATE directions SET iteration=?,updated_at=? WHERE id=?", (ordinal, now(), direction["id"]))
             db.execute("UPDATE runs SET round=round+1 WHERE id=?", (topic["run_id"],))
             for index, hypothesis, expression, values, parent in trials:
                 accepted += self._insert_candidate(db, topic, direction, experiment_id, ordinal,
-                                                   index, hypothesis, expression, values, parent, "PERIOD")
+                                                   index, hypothesis, expression, values, parent, initial_stage)
             if not accepted:
                 db.execute("UPDATE experiments SET stage='READY',status='failed',updated_at=? WHERE id=?", (now(), experiment_id))
         if not accepted:
-            self.store.set_cooldown("llm", 300, "no valid novel expressions")
-            return "no valid novel expressions"
+            if plans_override is not None:
+                with self.store.tx() as db:
+                    db.execute("UPDATE directions SET status='completed',conclusion=?,updated_at=? WHERE id=?",
+                               ("模型优化公式均与历史候选重复，停止重复重放同一方案", now(), direction["id"]))
+                log.warning("优化方案已停止重放 direction_id=%s reason=all expressions duplicated", direction["id"])
+                return "duplicate optimized expressions; direction completed"
+            return self._generation_failed(direction, "no valid novel expressions")
+        with self.store.tx() as db:
+            db.execute("DELETE FROM direction_generation_errors WHERE direction_id=?", (direction["id"],))
         log.info("实验批次已排队 experiment_id=%s direction_id=%s ordinal=%s structures=%s candidates=%s goal=%s",
                  experiment_id, direction["id"], ordinal, len(plans), accepted, goal)
         return f"experiment queued: {experiment_id} ({accepted} candidates)"
+
+    def _generation_failed(self, direction, reason):
+        with self.store.tx() as db:
+            db.execute("INSERT INTO direction_generation_errors VALUES (?,?,?,?) "
+                       "ON CONFLICT(direction_id) DO UPDATE SET consecutive=consecutive+1,"
+                       "last_reason=excluded.last_reason,updated_at=excluded.updated_at",
+                       (direction["id"], 1, reason, now()))
+            count = db.execute("SELECT consecutive FROM direction_generation_errors WHERE direction_id=?",
+                               (direction["id"],)).fetchone()["consecutive"]
+            if count >= self.config.max_invalid_generations:
+                db.execute("UPDATE directions SET status='completed',conclusion=?,updated_at=? WHERE id=?",
+                           (f"连续 {count} 次生成无有效公式：{reason}", now(), direction["id"]))
+        log.warning("Alpha 生成失败 direction_id=%s consecutive=%s/%s reason=%s", direction["id"],
+                    count, self.config.max_invalid_generations, reason)
+        if count >= self.config.max_invalid_generations:
+            return f"direction completed after {count} invalid generations"
+        self.store.set_cooldown("llm", 300, reason)
+        return reason
 
     def _stage_rows(self, experiment, stage=None):
         if (stage or experiment["stage"]) == "LEGACY":
@@ -348,7 +395,8 @@ class ResearchWorkflow:
             baseline_values = json.loads(baseline["parameter_values"] or "{}")
             for value in parameter["values"]:
                 values = {**baseline_values, parameter["name"]: value}
-                render_values = {name: values[name] for name in ["Period", *(item["name"] for item in plan["parameters"])]}
+                render_values = {name: values[name] for name in ["Period", *(item["name"] for item in plan["parameters"])]
+                                 if name in values}
                 expression = render_expression(plan["expression_template"], render_values)
                 if values.get("_inverted"):
                     expression = f"-({expression})"
@@ -677,12 +725,14 @@ class ResearchWorkflow:
             repaired, failure = self._model(lambda: self.alpha.repair({
                 "hypothesis": candidate["hypothesis"], "expression": candidate["expression"],
                 "error": error, "attempt": candidate["repair_attempts"] + 1,
-                "max_attempts": self.config.max_repair_attempts, "settings": json.loads(candidate["settings"]),
-                "allowed_fields": self.config.allowed_fields}))
+                "max_attempts": self.config.max_repair_attempts, "settings": json.loads(candidate["settings"])}))
             if failure:
                 return failure
-            expression = repaired["expression"].strip()
+            expression = (repaired["expression"] or "").strip()
             self.store.update_candidate(candidate["id"], repair_attempts=self.config.max_repair_attempts)
+            if not expression:
+                log.warning("公式无法修复 candidate=%s reason=%s", candidate["id"], repaired["reason"])
+                return f"formula unrepaired: {candidate['id']}"
             if not valid_expression(expression):
                 return f"repair invalid: {candidate['id']}"
             child = self.store.add_candidate(

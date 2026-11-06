@@ -1,30 +1,45 @@
 """Provider adapters for structured generation and research decisions."""
 
 import json
+from datetime import datetime
+from itertools import count
 import logging
+from threading import Lock
 import time
 from hashlib import sha256
 from pathlib import Path
 
 from .config import ModelConfig
+from .logging_setup import conversation_path, save_model_exchange
 from .parameter_search import normalize_plan
 from .transport import JsonTransport, RemoteError
 
 log = logging.getLogger(__name__)
+_request_numbers = count(1)
+_request_lock = Lock()
+
+
+def _next_request_number() -> int:
+    with _request_lock:
+        return next(_request_numbers)
 
 
 GENERATE_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {"candidates": {"type": "array", "items": {"type": "object", "additionalProperties": False,
         "properties": {"hypothesis": {"type": "string"}, "expression_template": {"type": "string"},
-                       "period": {"type": "object", "additionalProperties": False,
-                                  "properties": {"name": {"type": "string"}, "default": {"type": "integer"}},
-                                  "required": ["name", "default"]},
                        "parameters": {"type": "array", "items": {"type": "object", "additionalProperties": False,
                            "properties": {"name": {"type": "string"}, "default": {"type": "number"},
                                           "values": {"type": "array", "items": {"type": "number"}}},
                            "required": ["name", "default", "values"]}}},
-        "required": ["hypothesis", "expression_template", "period", "parameters"]}}}, "required": ["candidates"]}
+        "required": ["hypothesis", "expression_template", "parameters"]}}}, "required": ["candidates"]}
+LEGACY_GENERATE_SCHEMA = json.loads(json.dumps(GENERATE_SCHEMA))
+_legacy_candidate = LEGACY_GENERATE_SCHEMA["properties"]["candidates"]["items"]
+_legacy_candidate["properties"]["period"] = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"name": {"type": "string"}, "default": {"type": "integer"}},
+    "required": ["name", "default"]}
+_legacy_candidate["required"].append("period")
 DECIDE_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {"action": {"type": "string", "enum": ["NEW_DIRECTION", "OPTIMIZE", "TUNE", "SUBMIT"]},
@@ -70,14 +85,11 @@ FEEDBACK_SCHEMA = {"type": "object", "additionalProperties": False,
                                       "properties": {"parent_candidate_id": {"type": "string"},
                                                      "hypothesis": {"type": "string"},
                                                      "expression_template": {"type": "string"},
-                                                     "period": {"type": "object", "additionalProperties": False,
-                                                                "properties": {"name": {"type": "string"}, "default": {"type": "integer"}},
-                                                                "required": ["name", "default"]},
                                                      "parameters": GENERATE_SCHEMA["properties"]["candidates"]["items"]["properties"]["parameters"]},
-                                      "required": ["parent_candidate_id", "hypothesis", "expression_template", "period", "parameters"]}}},
+                                      "required": ["parent_candidate_id", "hypothesis", "expression_template", "parameters"]}}},
                    "required": ["action", "reason", "next_goal", "conclusion", "optimized_candidates"]}
 REPAIR_SCHEMA = {"type": "object", "additionalProperties": False,
-                 "properties": {"hypothesis": {"type": "string"}, "expression": {"type": "string"},
+                 "properties": {"hypothesis": {"type": "string"}, "expression": {"type": ["string", "null"]},
                                 "reason": {"type": "string"}},
                  "required": ["hypothesis", "expression", "reason"]}
 BRAINSTORM_SCHEMA = {"type": "object", "additionalProperties": False,
@@ -105,9 +117,6 @@ class LLM:
         return value
 
     def _call(self, system: str, user: dict, schema: dict, name: str) -> dict:
-        log.info("模型请求 stage=%s provider=%s model=%s format=%s", name, self.config.provider,
-                 self.config.model, self.config.api_format)
-        log.debug("模型输入 stage=%s system=%s context=%s", name, system, json.dumps(user, ensure_ascii=False))
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]
         base = self.config.base_url
@@ -136,8 +145,38 @@ class LLM:
             payload["store"] = False
         headers = {"Authorization": "Bearer " + self.config.api_key}
         started = time.monotonic()
+
+        def send(attempt: str):
+            request_no = _next_request_number()
+            exchange = {"timestamp": datetime.now().astimezone().isoformat(),
+                        "request_no": request_no, "stage": name, "attempt": attempt,
+                        "provider": self.config.provider, "model": self.config.model,
+                        "api_format": self.config.api_format, "messages": messages}
+            def journal(record: dict):
+                try:
+                    save_model_exchange(record)
+                except OSError as journal_error:
+                    log.error("模型对话保存失败 path=%s reason=%s", conversation_path(), journal_error)
+
+            journal({**exchange, "event": "request"})
+            log.info("模型请求 #%s stage=%s attempt=%s provider=%s model=%s format=%s",
+                     request_no, name, attempt, self.config.provider, self.config.model, self.config.api_format)
+            log.debug("模型输入 request_no=%s stage=%s system=%s context=%s", request_no, name,
+                      system, json.dumps(user, ensure_ascii=False))
+            try:
+                _, _, response = self.http.request("POST", url, payload, headers)
+            except RemoteError as error:
+                exchange["error"] = {"status": error.status, "message": str(error)}
+                journal({**exchange, "event": "failed"})
+                log.warning("模型请求失败 #%s stage=%s http=%s reason=%s", request_no, name,
+                            error.status, error)
+                raise
+            exchange["response"] = response
+            journal({**exchange, "event": "completed"})
+            return response, request_no
+
         try:
-            _, _, data = self.http.request("POST", url, payload, headers)
+            data, request_no = send("initial")
         except RemoteError as exc:
             # OpenAI-compatible gateways vary in structured-output support.
             # In auto mode, retain the JSON prompt and local validation.
@@ -151,17 +190,17 @@ class LLM:
             if self.config.api_format == "responses" and mode == "json_schema":
                 payload["text"] = {"format": {"type": "json_object"}}
                 try:
-                    _, _, data = self.http.request("POST", url, payload, headers)
+                    data, request_no = send("json_object_fallback")
                 except RemoteError as second:
                     if second.status not in {400, 422} or not any(
                         token in str(second).lower() for token in ("json_object", "text.format")
                     ):
                         raise
                     payload.pop("text", None)
-                    _, _, data = self.http.request("POST", url, payload, headers)
+                    data, request_no = send("plain_json_fallback")
             else:
                 payload.pop("response_format", None)
-                _, _, data = self.http.request("POST", url, payload, headers)
+                data, request_no = send("plain_json_fallback")
         try:
             if self.config.api_format == "responses":
                 parts = [c["text"] for item in data.get("output", []) if item.get("type") == "message"
@@ -171,12 +210,14 @@ class LLM:
                 raw = data["choices"][0]["message"]["content"]
             if not raw or not raw.strip():
                 raise ValueError("empty model output")
-            log.debug("模型原始文本 stage=%s text=%s", name, raw)
+            log.debug("模型原始文本 request_no=%s stage=%s text=%s", request_no, name, raw)
             value = json.loads(raw)
             if not isinstance(value, dict):
                 raise ValueError("model output must be an object")
-            log.debug("模型输出 stage=%s response=%s", name, json.dumps(value, ensure_ascii=False))
-            log.info("模型响应 stage=%s elapsed_seconds=%.1f", name, time.monotonic() - started)
+            log.debug("模型输出 request_no=%s stage=%s response=%s", request_no, name,
+                      json.dumps(value, ensure_ascii=False))
+            log.info("模型响应 #%s stage=%s elapsed_seconds=%.1f", request_no, name,
+                     time.monotonic() - started)
             return value
         except (KeyError, IndexError, ValueError, TypeError) as exc:
             raise RemoteError(0, f"Invalid {self.config.provider} response: {exc}") from exc
@@ -191,7 +232,7 @@ class LLM:
 
     def generate(self, context: dict) -> list[dict]:
         system = self._prompt(self.config.generate_prompt_file)
-        result = self._call(system, context, GENERATE_SCHEMA, "alpha_candidates")
+        result = self._call(system, context, LEGACY_GENERATE_SCHEMA, "alpha_candidates")
         candidates = result.get("candidates")
         if not isinstance(candidates, list) or not 1 <= len(candidates) <= int(context["requested_count"]):
             count = len(candidates) if isinstance(candidates, list) else type(candidates).__name__
@@ -315,6 +356,8 @@ class LLM:
         for candidate in candidates:
             if not isinstance(candidate, dict) or candidate.get("parent_candidate_id") not in allowed:
                 raise ValueError("Optimized candidate must reference a candidate in this experiment")
+            if "period" in candidate:
+                raise ValueError("Optimized candidate must use model-chosen parameters only")
             hypothesis = candidate.get("hypothesis")
             if not isinstance(hypothesis, str) or not hypothesis.strip():
                 raise ValueError("Optimized candidate needs a hypothesis")
@@ -335,6 +378,8 @@ class LLM:
         for item in items:
             if not isinstance(item, dict) or not isinstance(item.get("hypothesis"), str) or not item["hypothesis"].strip():
                 raise ValueError("Variant needs a hypothesis")
+            if "period" in item:
+                raise ValueError("Variant must use model-chosen parameters only")
             normalized.append({"hypothesis": item["hypothesis"].strip(), **normalize_plan(item)})
         return normalized
 
@@ -342,8 +387,10 @@ class LLM:
         result = self._call(self._prompt(self.config.repair_prompt_file), context,
                             REPAIR_SCHEMA, "alpha_repair")
         if any(not isinstance(result.get(key), str) or not result[key].strip()
-               for key in ("hypothesis", "expression", "reason")):
-            raise ValueError("Repair needs hypothesis, expression and reason")
+               for key in ("hypothesis", "reason")):
+            raise ValueError("Repair needs hypothesis and reason")
+        if "expression" not in result or (result["expression"] is not None and not isinstance(result["expression"], str)):
+            raise ValueError("Repair expression must be a string or null")
         return result
 
     def brainstorm_topic(self, context: dict) -> dict:

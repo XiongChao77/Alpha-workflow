@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -23,12 +24,42 @@ class FakeTransport:
 
 
 class LLMCompatibilityTests(unittest.TestCase):
+    def test_repair_can_report_no_viable_expression(self):
+        response = {"hypothesis": "Original idea", "expression": None, "reason": "No valid repair"}
+        fake = FakeTransport({"choices": [{"message": {"content": json.dumps(response)}}]})
+        model = LLM(ModelConfig("openai", "test-model", "fake-key", "https://example.test/v1",
+                                "chat_completions"), fake)
+        self.assertIsNone(model.repair_expression({"error": "Unknown operator"})["expression"])
+
+    def test_new_variant_schema_has_model_chosen_parameters_only(self):
+        from research_workflow.llm import GENERATE_SCHEMA, FEEDBACK_SCHEMA
+        variant = GENERATE_SCHEMA["properties"]["candidates"]["items"]
+        optimized = FEEDBACK_SCHEMA["properties"]["optimized_candidates"]["items"]
+        self.assertEqual(variant["required"], ["hypothesis", "expression_template", "parameters"])
+        self.assertNotIn("period", variant["properties"])
+        self.assertNotIn("period", optimized["properties"])
+        response = {"candidates": [{"hypothesis": "Signal", "expression_template": "rank(ts_mean(close,{Window})/close)",
+                                    "parameters": [{"name": "Window", "default": 12, "values": [8, 12, 24]}]}]}
+        fake = FakeTransport({"choices": [{"message": {"content": json.dumps(response)}}]})
+        model = LLM(ModelConfig("openai", "test-model", "fake-key", "https://example.test/v1",
+                                "chat_completions"), fake)
+        self.assertEqual(model.generate_variants({"requested_count": 2})[0]["parameters"][0]["name"], "Window")
+
+    def test_new_variant_rejects_old_fixed_parameter_shape(self):
+        response = {"candidates": [{"hypothesis": "Old signal", "expression_template": "rank(close/{Period})",
+                                    "period": {"name": "Period", "default": 30}, "parameters": []}]}
+        fake = FakeTransport({"choices": [{"message": {"content": json.dumps(response)}}]})
+        model = LLM(ModelConfig("openai", "test-model", "fake-key", "https://example.test/v1",
+                                "chat_completions"), fake)
+        with self.assertRaisesRegex(ValueError, "model-chosen parameters"):
+            model.generate_variants({"requested_count": 1})
+
     def test_batch_optimization_returns_direction_and_formula_in_one_call(self):
         response = {"action": "ITERATE", "reason": "Invert and smooth", "next_goal": "test a stable inverse",
                     "conclusion": "Original sign was wrong", "optimized_candidates": [{
                         "parent_candidate_id": "candidate1", "hypothesis": "Inverse impact",
-                        "expression_template": "-rank(ts_mean(returns,{Period}))",
-                        "period": {"name": "Period", "default": 45}, "parameters": []}]}
+                        "expression_template": "-rank(ts_mean(returns,{Window}))",
+                        "parameters": [{"name": "Window", "default": 45, "values": [30, 45, 60]}]}]}
         fake = FakeTransport({"choices": [{"message": {"content": json.dumps(response)}}]})
         model = LLM(ModelConfig("openai", "test-model", "fake-key", "https://example.test/v1",
                                 "chat_completions"), fake)
@@ -64,9 +95,15 @@ class LLMCompatibilityTests(unittest.TestCase):
         fake = FakeTransport({"choices": [{"message": {"content": '{"ok":true}'}}]}, True)
         config = ModelConfig("openai", "any-model", "fake-key", "https://example.test/v1",
                              "chat_completions", "auto", False)
-        self.assertEqual(LLM(config, fake)._call("Return JSON", {}, {}, "test"), {"ok": True})
+        with self.assertLogs("research_workflow.llm", level="INFO") as captured:
+            self.assertEqual(LLM(config, fake)._call("Return JSON", {}, {}, "test"), {"ok": True})
         self.assertEqual(len(fake.calls), 2)
         self.assertNotIn("response_format", fake.calls[1][2])
+        request_numbers = [int(match.group(1)) for line in captured.output
+                           if (match := re.search(r"模型请求 #(\d+) stage=", line))]
+        self.assertEqual(len(request_numbers), 2)
+        self.assertEqual(request_numbers[1], request_numbers[0] + 1)
+        self.assertTrue(any(f"模型响应 #{request_numbers[1]}" in line for line in captured.output))
 
     def test_probe_only_calls_model_endpoint(self):
         fake = FakeTransport({"choices": [{"message": {"content": '{"ok":true}'}}]})

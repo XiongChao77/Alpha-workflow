@@ -6,9 +6,9 @@
 
 使用 Python 3.11+，仅需标准库。复制 [config.env.example](config.env.example) 为 `research_workflow/config.env`，填写 `LLM_PROVIDER`、`LLM_MODEL`、`LLM_API_KEY`、`WQ_BRAIN_EMAIL` 和 `WQ_BRAIN_PASSWORD`。模型提供方选择 `openai` 或 `deepseek` 之一。第三方兼容网关可设置 `LLM_BASE_URL`、`LLM_API_FORMAT=chat_completions` 或 `responses`；基础地址应类似 `https://.../v1`，不要手动追加 `/chat/completions`。`LLM_JSON_MODE=auto` 会在网关拒绝结构化格式时回退并进行本地 JSON 校验。
 
-提示词都在 [prompts](prompts) 目录，启动后每次调用会重新读取。`config.env.example` 列出各提示词文件覆盖项。日志按启动时间分文件，记录模型调用阶段、提示词路径/哈希、探索方向、公式、BRAIN 指标和检查结果；密钥会遮盖。密钥不写入 SQLite 或 Alpha 归档。
+提示词都在 [prompts](prompts) 目录，启动后每次调用会重新读取。`config.env.example` 列出各提示词文件覆盖项。日志按启动时间分文件，每次实际模型 HTTP 请求按当前进程从 `#1` 递增编号；兼容格式重试也会获得新编号，响应日志使用相同编号。同目录的 `model_conversations_<启动时间>_<进程号>.jsonl` 逐行保存每次模型请求的 system/user 消息及原始响应或请求错误；请求发出前先记一条 `request`，完成后记录 `completed` 或 `failed`，编号与日志对应。密钥会遮盖。模型不受本地数据字段白名单限制，可探索 BRAIN 支持的数据和算子。普通日志还记录提示词路径/哈希、探索方向、公式、BRAIN 指标和检查结果。密钥不写入 SQLite 或 Alpha 归档。
 
-重要预算：`ALPHA_MAX_CONCURRENT_SIMULATIONS=3`、`ALPHA_MAX_SIMULATIONS_DAY=20`、`ALPHA_MAX_DIRECTIONS_TOPIC=3`、`ALPHA_MAX_EXPERIMENTS_DIRECTION=8`、`ALPHA_FAMILY_MAX_STAGNANT=5`、`ALPHA_MAX_REPAIR_ATTEMPTS=2`、`ALPHA_PERIOD_GRID=30,60,90`。Period 阶段还会测试模型给出的一个值；只有 `abs(Sharpe) > 1.2` 才进入下一阶段，门槛可用 `ALPHA_SHARPE_GATE` 调整。负 Sharpe 需要反向公式真实回测，不能直接通过提交检查。连续 5 个批次没有改善会停止 Direction。平台限流响应优先于本地预算。
+重要预算：`ALPHA_MAX_CONCURRENT_SIMULATIONS=3`、`ALPHA_MAX_SIMULATIONS_DAY=20`、`ALPHA_MAX_DIRECTIONS_TOPIC=3`、`ALPHA_MAX_EXPERIMENTS_DIRECTION=8`、`ALPHA_FAMILY_MAX_STAGNANT=5`、`ALPHA_MAX_REPAIR_ATTEMPTS=2`。模型自行选择 1～2 个参数及各自候选值；程序先测试第一个参数，其他参数取默认值。只有 `abs(Sharpe) > 1.2` 才考虑探索第二个参数，门槛可用 `ALPHA_SHARPE_GATE` 调整。负 Sharpe 需要反向公式真实回测，不能直接通过提交检查。连续 5 个批次没有改善会停止 Direction。平台限流响应优先于本地预算。
 
 ## 启动
 
@@ -38,7 +38,7 @@ python -m research_workflow topic list
 
 ## 实验与提交
 
-每个 Direction 由若干结构不同的公式构成一个实验批次。程序先批量测试 Period；每个 Sharpe 小于 `-1.2` 的候选都会将公式取反，作为同族新候选送 BRAIN 重新回测，后续调参只使用实际测得 Sharpe 大于 `1.2` 的候选。模型随后看到同族原式、反向式、参数和完整结果；决定继续时在**同一次调用**返回优化方向和 1～2 个新假设及 FASTEXPR 模板，程序展开并回测。公式语法、单位、类型错误由 Alpha Agent 最多修复两次。所有候选，包括失败结果，都保留在 SQLite 和 `alpha_libraries/candidates/*.json`。
+每个 Direction 由若干结构不同的公式构成一个实验批次。程序先批量测试模型给出的第一个参数；每个 Sharpe 小于 `-1.2` 的候选都会将公式取反，作为同族新候选送 BRAIN 重新回测，后续调参只使用实际测得 Sharpe 大于 `1.2` 的候选。模型随后看到同族原式、反向式、参数和完整结果；决定继续时在**同一次调用**返回优化方向和 1～2 个新假设及 FASTEXPR 模板，程序展开并回测。公式语法、单位、类型错误由 Alpha Agent 最多修复两次。所有候选，包括失败结果，都保留在 SQLite 和 `alpha_libraries/candidates/*.json`。SQLite 中已有的旧批次仍按其保存的参数计划恢复，不会被重新展开。
 
 单因子批次结束时，系统还可从**同一 Direction** 选两个候选组合，按换手差异排序，不要求父因子的回测设置相同。组合使用当前目标配置重新回测，默认测试三个权重 `0.25/0.75`、`0.5/0.5`、`0.75/0.25`；每对因子的三个权重算一次组合尝试。组合最佳 Fitness 未超过某父因子本身的 Fitness，记该父因子一次失败；连续两次失败后不再选它参与新组合。不同设置下的父因子 Fitness 比较只用于配对退出启发式，组合是否合格以其自身的 BRAIN 检查为准。可用 `ALPHA_MAX_COMBINATION_PAIRS`、`ALPHA_COMBINATION_WEIGHTS` 控制组合预算。独立或组合正式提交会原子占用其基础因子，防止任何基础因子被提交两次。
 
@@ -49,3 +49,4 @@ python -m research_workflow topic list
 ## 限流与恢复
 
 BRAIN 返回 429/503 时保存 `Retry-After` 冷却；未知模拟 POST 结果标记 `unknown`，不盲目重复提交。`WARNING` 且带 Alpha ID 时继续读取详情，有 IS 指标则进入检查，否则继续轮询。没有已证实适用于所有 BRAIN 账号的统一模拟日上限，`ALPHA_MAX_SIMULATIONS_DAY` 是本地安全预算，可按账户情况调整。
+本地允许最多 4096 字符的 FASTEXPR 公式，实际语法、长度和算子数仍由 BRAIN 最终判定。公式失败时，系统将 BRAIN 返回的错误原文和失败公式交给 Alpha Agent，由模型自行决定修复方式。生成的所有公式均无效或重复时，日志会记录原因并冷却；同一 Direction 连续失败 `ALPHA_MAX_INVALID_GENERATIONS` 次（默认 3）后转向下一 Direction。

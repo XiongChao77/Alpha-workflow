@@ -115,6 +115,9 @@ class Store:
                     iteration INTEGER NOT NULL DEFAULT 0, conclusion TEXT,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS ix_directions_topic ON directions(topic_id,status);
+                CREATE TABLE IF NOT EXISTS direction_generation_errors (
+                    direction_id TEXT PRIMARY KEY, consecutive INTEGER NOT NULL,
+                    last_reason TEXT NOT NULL, updated_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS experiments (
                     id TEXT PRIMARY KEY, direction_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
                     goal TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,

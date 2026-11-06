@@ -85,7 +85,9 @@ def stagnant_count(family):
 
 
 def valid_expression(expression: str) -> bool:
-    if not 3 <= len(expression) <= 500 or expression.count("(") != expression.count(")"):
+    # BRAIN validates its own expression size and syntax. Keep only a generous
+    # local guard so multi-statement FASTEXPR is not discarded before POST.
+    if not 3 <= len(expression) <= 4096 or expression.count("(") != expression.count(")"):
         return False
     depth = 0
     for char in expression:

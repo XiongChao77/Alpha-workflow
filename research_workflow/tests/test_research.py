@@ -13,13 +13,13 @@ class FakeConfig:
     max_directions_topic = 2
     max_experiments_direction = 2
     max_repair_attempts = 2
+    max_invalid_generations = 3
     family_max_stagnant = 5
     sharpe_gate = 1.2
     max_combination_pairs = 0
     combination_weights = (0.25, 0.5, 0.75)
     max_simulations_day = 20
     period_grid = (30, 60, 90)
-    allowed_fields = ("close", "volume")
 
     def settings(self):
         return {"region": "USA", "delay": 1}
@@ -35,6 +35,7 @@ class FakeModel:
     def __init__(self):
         self.feedback_calls = []
         self.variants_calls = 0
+        self.repair_contexts = []
 
     def generate_topic(self, context):
         return {"title": "Autonomous topic", "objective": "Explore reversal", "rationale": "market mechanism"}
@@ -56,6 +57,7 @@ class FakeModel:
                 "next_goal": "", "conclusion": "No stable signal"}
 
     def repair_expression(self, context):
+        self.repair_contexts.append(context)
         return {"hypothesis": context["hypothesis"], "expression": "rank(close / ts_mean(close,30))",
                 "reason": "Remove incompatible term"}
 
@@ -88,6 +90,43 @@ class ResearchTests(unittest.TestCase):
         self.model = FakeModel()
         self.workflow = ResearchWorkflow(FakeConfig(), self.store, ResearchAgent(self.model),
                                          AlphaAgent(self.model), FakeEngine())
+
+    def test_new_plans_search_model_parameters_without_fixed_grid(self):
+        class ChosenParametersModel(FakeModel):
+            def generate_variants(self, context):
+                return [{"hypothesis": "Short horizon reversal",
+                         "expression_template": "rank(ts_mean(close,{Window})/close)*{Weight}",
+                         "parameters": [{"name": "Window", "default": 12, "values": [8, 12, 24]},
+                                        {"name": "Weight", "default": 1, "values": [0.5, 1, 2]}]}]
+
+            def analyze_batch(self, context):
+                self.feedback_calls.append(context)
+                if context["can_explore_param2"]:
+                    return {"action": "EXPLORE_PARAM2", "reason": "Test weight", "next_goal": "",
+                            "conclusion": "", "optimized_candidates": []}
+                return {"action": "SWITCH_DIRECTION", "reason": "Done", "next_goal": "",
+                        "conclusion": "Done", "optimized_candidates": []}
+
+        self.model = ChosenParametersModel()
+        self.workflow = ResearchWorkflow(FakeConfig(), self.store, ResearchAgent(self.model),
+                                         AlphaAgent(self.model), FakeEngine())
+        self.workflow.add_topic("Model chosen parameters")
+        self.assertIn("experiment queued", self.workflow.step())
+        experiment = self.store.one("SELECT * FROM experiments LIMIT 1")
+        self.assertEqual(experiment["stage"], "PARAM1")
+        rows = self.store.all("SELECT * FROM candidates WHERE experiment_id=?", (experiment["id"],))
+        self.assertEqual({json.loads(row["parameter_values"])["Window"] for row in rows}, {8, 12, 24})
+        self.assertTrue(all(json.loads(row["parameter_values"])["Weight"] == 1 for row in rows))
+        self.assertTrue(all("Period" not in row["expression"] for row in rows))
+        for row in rows:
+            window = json.loads(row["parameter_values"])["Window"]
+            self.store.update_candidate(row["id"], status="rejected",
+                                        result={"is": {"sharpe": 1.4 if window == 12 else 0.6}})
+        self.assertIn("PARAM2 queued", self.workflow.step())
+        second = self.store.all("SELECT * FROM candidates WHERE experiment_id=? AND origin_action='PARAM2'",
+                                (experiment["id"],))
+        self.assertEqual({json.loads(row["parameter_values"])["Weight"] for row in second}, {0.5, 2})
+        self.assertTrue(all(json.loads(row["parameter_values"])["Window"] == 12 for row in second))
 
     def test_topic_queue_batch_parameter_gate_and_feedback(self):
         topic_id = self.workflow.add_topic("Researcher topic", priority=3)
@@ -122,6 +161,36 @@ class ResearchTests(unittest.TestCase):
         child = self.store.one("SELECT * FROM candidates WHERE parent_candidate_id=?", (row["id"],))
         self.assertEqual(child["repair_attempts"], 1)
         self.assertEqual(child["experiment_id"], row["experiment_id"])
+
+    def test_brain_error_is_sent_verbatim_to_alpha_repair(self):
+        self.workflow.step()
+        row = self.store.one("SELECT * FROM candidates ORDER BY created_at,id LIMIT 1")
+        message = "Expression with 113 operators exceeds limit of 64."
+        self.store.update_candidate(row["id"], status="failed", result={
+            "status": "ERROR", "message": message})
+        self.assertIn("formula repaired", self.workflow.step())
+        self.assertEqual(self.model.repair_contexts[0]["error"], message)
+        self.assertNotIn("operator_budget", self.model.repair_contexts[0])
+        self.assertNotIn("allowed_fields", self.model.repair_contexts[0])
+
+    def test_model_can_decline_unrepairable_formula_without_retry_loop(self):
+        class CannotRepair(FakeModel):
+            def repair_expression(self, context):
+                self.repair_contexts.append(context)
+                return {"hypothesis": context["hypothesis"], "expression": None,
+                        "reason": "No viable correction for this platform error"}
+
+        self.model = CannotRepair()
+        self.workflow = ResearchWorkflow(FakeConfig(), self.store, ResearchAgent(self.model),
+                                         AlphaAgent(self.model), FakeEngine())
+        self.workflow.step()
+        row = self.store.one("SELECT * FROM candidates ORDER BY created_at,id LIMIT 1")
+        self.store.update_candidate(row["id"], status="failed", result={"message": "Unknown operator"})
+        self.assertIn("formula unrepaired", self.workflow.step())
+        self.assertEqual(self.store.one("SELECT repair_attempts FROM candidates WHERE id=?", (row["id"],))["repair_attempts"],
+                         FakeConfig.max_repair_attempts)
+        self.assertNotIn("allowed_fields", self.model.repair_contexts[0])
+        self.assertEqual(len(self.model.repair_contexts), 1)
 
     def test_existing_running_run_is_adopted_with_its_candidates(self):
         run_id = self.store.create_run("Old objective", "Old direction")
@@ -231,6 +300,39 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("direction completed", self.workflow.step())
         self.assertEqual(len(self.model.feedback_calls[1]["family_history"]), 1)
         self.assertEqual(self.model.feedback_calls[1]["family_history"][0]["statistics"]["count"], 8)
+
+    def test_invalid_optimized_plan_is_not_replayed_forever(self):
+        self.workflow.add_topic("Invalid optimization")
+        self.workflow.step()
+        topic = self.store.one("SELECT * FROM topics WHERE status='active'")
+        direction = self.store.one("SELECT * FROM directions WHERE status='active'")
+        invalid = [{"parent_candidate_id": "old", "hypothesis": "invalid syntax",
+                    "expression_template": "rank(close,{Period}) #invalid",
+                    "period": {"name": "Period", "default": 30}, "parameters": []}]
+        result = self.workflow._create_experiment(topic, direction, "try repair", invalid)
+        self.assertIn("direction completed", result)
+        self.assertEqual(self.store.one("SELECT status FROM directions WHERE id=?", (direction["id"],))["status"],
+                         "completed")
+
+    def test_repeated_invalid_initial_plans_stop_direction_after_three_attempts(self):
+        class InvalidModel(FakeModel):
+            def generate_variants(self, context):
+                return [{"hypothesis": "bad syntax", "expression_template": "rank(close,{Period}) #invalid",
+                         "period": {"name": "Period", "default": 30}, "parameters": []}]
+
+        self.model = InvalidModel()
+        self.workflow = ResearchWorkflow(FakeConfig(), self.store, ResearchAgent(self.model),
+                                         AlphaAgent(self.model), FakeEngine())
+        self.workflow.add_topic("Invalid initial plans")
+        self.assertEqual(self.workflow.step(), "no valid expressions")
+        direction = self.store.one("SELECT * FROM directions WHERE status='active'")
+        for _ in range(2):
+            with self.store.tx() as db:
+                db.execute("DELETE FROM cooldowns WHERE service='llm'")
+            result = self.workflow.step()
+        self.assertIn("direction completed", result)
+        self.assertEqual(self.store.one("SELECT consecutive FROM direction_generation_errors WHERE direction_id=?",
+                                        (direction["id"],))["consecutive"], 3)
 
     def test_failed_inverse_does_not_enter_parameter_search(self):
         self.workflow.add_topic("Negative signal")

@@ -21,18 +21,20 @@ def normalize_plan(candidate):
     parameters = candidate.get("parameters", [])
     if not isinstance(template, str) or not template.strip():
         raise ValueError("expression_template must be a nonempty string")
-    if not isinstance(period, dict) or period.get("name") != "Period":
-        raise ValueError("period must have name Period and one default value")
-    period_default = period.get("default")
-    if (isinstance(period_default, bool) or not isinstance(period_default, (int, float)) or
-            not math.isfinite(period_default) or not float(period_default).is_integer() or
-            period_default < 1 or period_default > 1000):
-        raise ValueError("Period default must be an integer in 1..1000")
-    period_default = int(period_default)
-    if not isinstance(parameters, list) or len(parameters) > 2:
-        raise ValueError("parameters must contain at most two additional dimensions")
+    legacy = period is not None
+    if legacy:
+        if not isinstance(period, dict) or period.get("name") != "Period":
+            raise ValueError("Invalid legacy period")
+        period_default = period.get("default")
+        if (isinstance(period_default, bool) or not isinstance(period_default, (int, float)) or
+                not math.isfinite(period_default) or not float(period_default).is_integer() or
+                period_default < 1 or period_default > 1000):
+            raise ValueError("Invalid legacy period default")
+        period_default = int(period_default)
+    if not isinstance(parameters, list) or not (0 if legacy else 1) <= len(parameters) <= 2:
+        raise ValueError("parameters must contain 1 or 2 dimensions (at most two for legacy plans)")
     normalized = []
-    names = {"Period"}
+    names = {"Period"} if legacy else set()
     for item in parameters:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not NAME.fullmatch(item["name"]):
             raise ValueError("Parameter name must be an ASCII identifier")
@@ -49,8 +51,10 @@ def normalize_plan(candidate):
     found = set(PLACEHOLDER.findall(template))
     if found != names or re.sub(PLACEHOLDER, "", template).find("{") >= 0 or re.sub(PLACEHOLDER, "", template).find("}") >= 0:
         raise ValueError(f"Template placeholders must match declared parameters; found={sorted(found)} expected={sorted(names)}")
-    return {"expression_template": template.strip(),
-            "period": {"name": "Period", "default": period_default}, "parameters": normalized}
+    plan = {"expression_template": template.strip(), "parameters": normalized}
+    if legacy:
+        plan["period"] = {"name": "Period", "default": period_default}
+    return plan
 
 
 def render_expression(template, values):
